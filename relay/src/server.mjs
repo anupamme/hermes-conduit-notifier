@@ -469,11 +469,12 @@ function notificationFor(event, preferences, gateway = undefined) {
   // different profiles and sessions distinguishable in Notification Center.
   const body = preferences.show_previews && event.body ? event.body : notificationContext(generic.body, event);
   const completion = event.type === 'response.ready' || event.type === 'background_task.finished';
-  // Approval and clarify pushes wait on the user, so they chime by default.
-  // `!== false` keeps installations whose stored preferences predate the
-  // key on that default.
+  // Approval and clarify pushes wait on the user, so they chime by default:
+  // `!== false` keeps installations whose stored preferences predate
+  // attention_sound on that default. completion_sound keeps its original
+  // truthy test, so its behavior for any stored shape is unchanged.
   const attention = event.type === 'approval.needed' || event.type === 'input.needed';
-  const sound = (completion && preferences.completion_sound !== false) || (attention && preferences.attention_sound !== false);
+  const sound = (completion && preferences.completion_sound) || (attention && preferences.attention_sound !== false);
   // `decision` carries structured approval card content so Conduit can render
   // an answerable card from the push payload alone — the one-shot gateway
   // stream event is missed while the app is backgrounded. It has its own

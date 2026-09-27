@@ -20,7 +20,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     commands.add_parser("unpair", help="Revoke this profile's relay credential")
     redact = commands.add_parser(
         "redact",
-        help="Keep chat text off the relay; cards stay answerable with generic text",
+        help="Redact chat text from pushes; choice labels still transit so cards stay answerable",
     )
     redact.add_argument("mode", choices=["on", "off"])
     parser.set_defaults(func=dispatch)
@@ -59,7 +59,9 @@ def dispatch(args: argparse.Namespace) -> int:
         print("Test notification accepted by the Conduit relay.")
         return 0
     if action == "redact":
-        set_redact_content(args.mode == "on")
+        if not set_redact_content(args.mode == "on"):
+            print("This Hermes profile is not paired with Conduit.")
+            return 1
         print(
             "Notification content is redacted; approval and clarify cards use generic text."
             if args.mode == "on"

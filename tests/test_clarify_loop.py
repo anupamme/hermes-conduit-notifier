@@ -720,3 +720,28 @@ def test_send_now_redacts_only_when_the_profile_opts_in(monkeypatch):
 
     assert sent[0]["body"] == "Run rm -rf build"
     assert "body" not in sent[1]
+
+
+def test_enqueued_events_are_redacted_once_on_delivery(monkeypatch):
+    # Other tests replace loop.client.enqueue with a fake for good, so load a
+    # private copy of the real client module to exercise the real queue.
+    spec = importlib.util.spec_from_file_location("conduit_push._client_under_test", ROOT / "client.py")
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    sent = []
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
+    monkeypatch.setattr(client, "load_state", lambda: {"relay_url": "https://relay", "credential": "x", "redact_content": True})
+    event = {
+        "event_id": "input:12345678",
+        "type": "input.needed",
+        "body": "Deploy to prod?",
+        "decision": {"kind": "clarify", "request_id": "conduit-push-abc123", "question": "Deploy to prod?", "choices": ["Yes", "No"]},
+    }
+
+    assert client.enqueue(event)
+    client._events.join()
+
+    assert len(sent) == 1
+    assert "body" not in sent[0]
+    assert "Deploy to prod?" not in json.dumps(sent[0])
+    assert sent[0]["decision"]["choices"] == ["Yes", "No"]

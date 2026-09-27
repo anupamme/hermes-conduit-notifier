@@ -37,7 +37,7 @@ hermes conduit-push status
 # Send a local test event through the relay
 hermes conduit-push test
 
-# Keep chat text off the relay (see Privacy and security)
+# Redact chat text from pushes (see Privacy and security)
 hermes conduit-push redact on
 
 # Revoke this profile's credential

@@ -102,12 +102,11 @@ def enqueue(event: dict[str, Any]) -> bool:
     on this event, so a drop has to fall back to the native clarify path
     instead of polling an answer that can never arrive.
     """
-    state = load_state()
-    if not state:
+    if not load_state():
         return False
     _start_worker()
     try:
-        _events.put_nowait(_outgoing(event, state))
+        _events.put_nowait(event)
     except queue.Full:
         logger.warning("Conduit notification queue is full; dropping %s", event.get("type", "event"))
         return False
@@ -127,18 +126,25 @@ def send_now(event: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     )
 
 
-def set_redact_content(enabled: bool) -> None:
-    """Persist this profile's content-redaction switch (#192)."""
+def set_redact_content(enabled: bool) -> bool:
+    """Persist this profile's content-redaction switch (#192).
+
+    Returns False when the profile is not paired (nothing to configure).
+    """
     state = load_state()
     if not state:
-        raise RuntimeError("This Hermes profile is not paired with Conduit.")
+        return False
     state["redact_content"] = bool(enabled)
     save_state(state)
+    return True
 
 
 def _outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    # Redaction happens at the one egress chokepoint, so every hook and the
-    # clarify loop get it without each builder having to remember.
+    # send_now is the one egress chokepoint (the delivery worker drains
+    # enqueue() through it), so redaction runs exactly once per event and
+    # every hook and the clarify loop get it without each builder having to
+    # remember. Reading the flag at send time also means a `redact on`
+    # takes effect for events already queued.
     return redact_event(event) if state.get("redact_content") else event
 
 
