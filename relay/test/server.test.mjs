@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
 import { notificationFor, validateEvent, validateDecision } from '../src/server.mjs';
+import { normalizePreferences } from '../src/store.mjs';
 
 const preferences = { show_previews: true, completion_sound: false };
 
@@ -432,4 +433,24 @@ test('gateway-less direct callers keep the legacy collapse/thread shapes', () =>
   assert.equal(noSession.collapseId, 'cron:run-42');
   assert.equal(noSession.payload.aps['thread-id'], 'hermes');
   assert.equal(noSession.threadId, 'hermes');
+});
+
+test('approval and clarify pushes chime by default; attention_sound opts out; completion keeps its own toggle', () => {
+  const base = { eventId: 'e:12345678', sessionId: 'sess-1', profile: 'default' };
+  const sound = (type, prefs) => notificationFor({ ...base, type }, prefs).payload.aps.sound;
+  // Legacy stored preferences (no attention_sound key) default to sound on.
+  assert.equal(sound('approval.needed', { completion_sound: false }), 'default');
+  assert.equal(sound('input.needed', { completion_sound: false }), 'default');
+  assert.equal(sound('approval.needed', { attention_sound: true }), 'default');
+  assert.equal(sound('approval.needed', { attention_sound: false, completion_sound: true }), undefined);
+  assert.equal(sound('input.needed', { attention_sound: false, completion_sound: true }), undefined);
+  // Completion sound is unchanged and independent of attention_sound.
+  assert.equal(sound('response.ready', { completion_sound: true, attention_sound: false }), 'default');
+  assert.equal(sound('response.ready', { completion_sound: false, attention_sound: true }), undefined);
+  assert.equal(sound('turn.failed', { completion_sound: true, attention_sound: true }), undefined);
+});
+
+test('normalizePreferences defaults attention_sound on and keeps an explicit opt-out', () => {
+  assert.equal(normalizePreferences({}).attention_sound, true);
+  assert.equal(normalizePreferences({ attention_sound: false }).attention_sound, false);
 });
