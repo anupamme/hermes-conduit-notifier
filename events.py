@@ -95,26 +95,38 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     them; an approval's are the fixed once/deny vocabulary. Returns a new
     dict; the input is not mutated.
     """
-    # Fail closed: anything that is not a recognizable decision shape is
-    # dropped rather than passed through with its text intact.
-    redacted = {key: value for key, value in event.items() if key not in ("title", "body", "decision")}
+    # Fail closed: both the event and its decision are rebuilt from explicit
+    # allowlists, so an unknown or text-bearing key (a raw `command`, say)
+    # can never ride along with a redacted event.
+    redacted = {key: event[key] for key in _REDACTED_EVENT_KEYS if key in event}
     decision = event.get("decision")
-    if isinstance(decision, dict) and decision.get("kind") in ("approval", "clarify"):
-        decision = dict(decision)
-        if decision.get("kind") == "approval":
-            decision["description"] = REDACTED_APPROVAL_TEXT
-        elif decision.get("kind") == "clarify":
-            decision["question"] = REDACTED_QUESTION_TEXT
-            questions = decision.get("questions")
-            if isinstance(questions, list):
-                decision["questions"] = [
-                    {**entry, "question": f"Question {index + 1}"}
-                    for index, entry in enumerate(entry for entry in questions if isinstance(entry, dict))
-                ]
-            elif "questions" in decision:
-                del decision["questions"]
-        redacted["decision"] = decision
+    if isinstance(decision, dict) and decision.get("kind") == "approval":
+        redacted["decision"] = {
+            "kind": "approval",
+            "description": REDACTED_APPROVAL_TEXT,
+            **{key: decision[key] for key in ("session_key", "choices") if key in decision},
+        }
+    elif isinstance(decision, dict) and decision.get("kind") == "clarify":
+        clarify: dict[str, Any] = {
+            "kind": "clarify",
+            "question": REDACTED_QUESTION_TEXT,
+            **{key: decision[key] for key in ("request_id", "choices") if key in decision},
+        }
+        questions = decision.get("questions")
+        if isinstance(questions, list):
+            entries = [entry for entry in questions if isinstance(entry, dict)]
+            clarify["questions"] = [
+                {
+                    "question": f"Question {index + 1}",
+                    **{key: entry[key] for key in ("qid", "choices", "multi_select") if key in entry},
+                }
+                for index, entry in enumerate(entries)
+            ]
+        redacted["decision"] = clarify
     return redacted
+
+
+_REDACTED_EVENT_KEYS = ("event_id", "type", "plugin_version", "plugin_capabilities", "session_id", "profile")
 
 
 def approval_decision(*, session_key: str, description: str) -> dict[str, Any]:

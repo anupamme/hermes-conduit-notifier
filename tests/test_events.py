@@ -397,3 +397,16 @@ def test_redact_event_fails_closed_on_unexpected_shapes():
     assert "secret" not in json.dumps(redacted)
     assert redacted["decision"]["questions"] == [{"qid": "q1", "question": "Question 1"}]
     assert "questions" not in redact_event({"decision": {"kind": "clarify", "question": "secret", "questions": "secret"}})["decision"]
+
+
+def test_redact_event_drops_unknown_keys_at_every_level():
+    redacted = redact_event({
+        "event_id": "approval:1",
+        "type": "approval.needed",
+        "extra": "secret",
+        "decision": {"kind": "approval", "session_key": "s", "description": "x", "command": "rm -rf / secret", "choices": ["once", "deny"]},
+    })
+    assert "secret" not in json.dumps(redacted)
+    assert redacted["decision"] == {"kind": "approval", "description": REDACTED_APPROVAL_TEXT, "session_key": "s", "choices": ["once", "deny"]}
+    clarify = redact_event({"decision": {"kind": "clarify", "request_id": "r", "question": "q", "questions": [{"qid": "q1", "question": "q", "note": "secret"}]}})
+    assert "secret" not in json.dumps(clarify)
