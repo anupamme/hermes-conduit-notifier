@@ -12,6 +12,7 @@ The API key is never returned, logged, or written anywhere.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -23,7 +24,7 @@ import urllib.request
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
@@ -46,10 +47,26 @@ REQUEST_TIMEOUT_S = 15.0
 # bursts, but stop a looping client from burning the host's Gemini quota.
 MINT_LIMIT = 20
 MINT_WINDOW_S = 60.0
-EDGE_LIMIT_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_LIMIT"
-EDGE_WINDOW_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_WINDOW_S"
-DEFAULT_EDGE_LIMIT = MINT_LIMIT * 3
-DEFAULT_EDGE_WINDOW_S = MINT_WINDOW_S
+EDGE_STATUS_LIMIT_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_STATUS_LIMIT"
+EDGE_STATUS_WINDOW_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_STATUS_WINDOW_S"
+EDGE_TOKEN_LIMIT_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_TOKEN_LIMIT"
+EDGE_TOKEN_WINDOW_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_TOKEN_WINDOW_S"
+TRUST_PROXY_ENV_VAR = "CONDUIT_GEMINI_LIVE_TRUST_PROXY"
+# /status is a cheap, side-effect-free read with no per-profile limiter of its
+# own, so its edge budget is generous -- sized to comfortably exceed normal
+# dashboard polling cadence rather than to closely ration usage.
+DEFAULT_EDGE_STATUS_LIMIT = 60
+DEFAULT_EDGE_STATUS_WINDOW_S = 60.0
+# /token feeds Google quota, so its edge budget (enforced before profile
+# resolution) matches the per-profile MINT_LIMIT/MINT_WINDOW_S it backstops,
+# rather than being loosened just because it shares infrastructure with
+# /status.
+DEFAULT_EDGE_TOKEN_LIMIT = MINT_LIMIT
+DEFAULT_EDGE_TOKEN_WINDOW_S = MINT_WINDOW_S
+# Same strict "1" check as relay's TRUST_PROXY (relay/src/server.mjs):
+# X-Forwarded-For is only trusted when explicitly told this host sits behind
+# a reverse proxy that overwrites/strips any client-supplied copy of it.
+TRUST_PROXY = os.environ.get(TRUST_PROXY_ENV_VAR) == "1"
 
 
 class TokenError(Exception):
@@ -191,19 +208,38 @@ def mint_gemini_live_token(
 class _MintLimiter:
     """Sliding-window cap on requests, keyed by a caller-supplied key."""
 
-    def __init__(self, limit: int, window_s: float, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        limit: int,
+        window_s: float,
+        clock: Callable[[], float] = time.monotonic,
+        sweep_size_threshold: int = 1000,
+        sweep_interval_s: float = 30.0,
+    ) -> None:
         self.limit = limit
         self.window_s = window_s
         self.clock = clock
+        self.sweep_size_threshold = sweep_size_threshold
+        self.sweep_interval_s = sweep_interval_s
         self._mints: Dict[str, deque] = {}
         self._lock = threading.Lock()
+        self._last_sweep_at = float("-inf")
 
     def acquire(self, key: str) -> None:
         now = self.clock()
         with self._lock:
-            # Drop buckets whose newest mint has aged out, so idle keys don't pile up.
-            for stale in [k for k, q in self._mints.items() if now - q[-1] >= self.window_s]:
-                del self._mints[stale]
+            # A full-dict scan on every call is fine when keys are bounded
+            # (profile names), but keys can also be caller addresses, which
+            # an attacker influences. Gate the scan by size and time -- like
+            # relay's enforceRateLimit sweep -- so a flood of one-off keys
+            # can't turn every request into an O(n) scan.
+            if (
+                len(self._mints) > self.sweep_size_threshold
+                and now - self._last_sweep_at > self.sweep_interval_s
+            ):
+                self._last_sweep_at = now
+                for stale in [k for k, q in self._mints.items() if now - q[-1] >= self.window_s]:
+                    del self._mints[stale]
             mints = self._mints.setdefault(key, deque())
             while mints and now - mints[0] >= self.window_s:
                 mints.popleft()
@@ -213,7 +249,7 @@ class _MintLimiter:
                 retry_after_s = self.window_s - (now - mints[0])
                 raise TokenError(
                     429,
-                    "Too many Gemini Live token requests; try again shortly",
+                    "Too many Gemini Live requests; try again shortly",
                     retry_after_s=retry_after_s,
                 )
             mints.append(now)
@@ -222,8 +258,11 @@ class _MintLimiter:
 _mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S)
 
 
-def _positive_int_env(name: str, default: int) -> int:
-    """Read a positive int policy value directly from the process environment.
+_T = TypeVar("_T", int, float)
+
+
+def _positive_env(name: str, default: _T, cast: Callable[[str], _T]) -> _T:
+    """Read a positive policy value directly from the process environment.
 
     Edge-limiter policy is process-wide, set once at import time -- not a
     per-request/profile-scoped lookup -- so this intentionally bypasses
@@ -234,22 +273,7 @@ def _positive_int_env(name: str, default: int) -> int:
     if not raw:
         return default
     try:
-        value = int(raw)
-    except ValueError:
-        logger.warning("Ignoring invalid %s=%r; using default %d", name, raw, default)
-        return default
-    if value <= 0:
-        logger.warning("Ignoring non-positive %s=%r; using default %d", name, raw, default)
-        return default
-    return value
-
-
-def _positive_float_env(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        value = float(raw)
+        value = cast(raw)
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; using default %s", name, raw, default)
         return default
@@ -259,24 +283,25 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
-# Edge-level cap, keyed per calling client (see _client_id) rather than per
-# profile, so it can't be bypassed by rotating profile names, and it also
-# covers /status (which has no per-profile limiter at all) and requests that
-# fail before ever reaching Google (e.g. bad profile, missing key).
-#
-# Unlike a single global bucket, keying by caller means one caller
-# exhausting its budget cannot 429 unrelated callers. /status and /token
-# intentionally share one bucket per caller (see the route handlers below),
-# so this is one ceiling on a caller's overall use of the Gemini Live edge
-# surface, not two independent ones.
+# Edge-level caps, keyed per calling client (see _client_id) rather than per
+# profile, so they can't be bypassed by rotating profile names, and they also
+# cover requests that fail before ever reaching Google (e.g. bad profile,
+# missing key). Keying by caller means one caller exhausting its budget
+# cannot 429 unrelated callers. /status and /token get independent budgets
+# (rather than sharing one) so routine status polling can't starve token
+# minting.
 #
 # Like _mint_limiter, this state is in-process only: if this dashboard ever
 # runs with multiple worker processes, each worker enforces its own
 # independent per-caller budget rather than one budget shared across
 # workers.
-_EDGE_LIMIT = _positive_int_env(EDGE_LIMIT_ENV_VAR, DEFAULT_EDGE_LIMIT)
-_EDGE_WINDOW_S = _positive_float_env(EDGE_WINDOW_ENV_VAR, DEFAULT_EDGE_WINDOW_S)
-_edge_limiter = _MintLimiter(_EDGE_LIMIT, _EDGE_WINDOW_S)
+_EDGE_STATUS_LIMIT = _positive_env(EDGE_STATUS_LIMIT_ENV_VAR, DEFAULT_EDGE_STATUS_LIMIT, int)
+_EDGE_STATUS_WINDOW_S = _positive_env(EDGE_STATUS_WINDOW_ENV_VAR, DEFAULT_EDGE_STATUS_WINDOW_S, float)
+_edge_status_limiter = _MintLimiter(_EDGE_STATUS_LIMIT, _EDGE_STATUS_WINDOW_S)
+
+_EDGE_TOKEN_LIMIT = _positive_env(EDGE_TOKEN_LIMIT_ENV_VAR, DEFAULT_EDGE_TOKEN_LIMIT, int)
+_EDGE_TOKEN_WINDOW_S = _positive_env(EDGE_TOKEN_WINDOW_ENV_VAR, DEFAULT_EDGE_TOKEN_WINDOW_S, float)
+_edge_token_limiter = _MintLimiter(_EDGE_TOKEN_LIMIT, _EDGE_TOKEN_WINDOW_S)
 
 
 def _profile_scope(profile: Optional[str]):
@@ -303,22 +328,43 @@ async def _run_scoped(profile: Optional[str], fn: Callable[[], Dict[str, Any]]) 
     return await asyncio.get_running_loop().run_in_executor(None, scoped)
 
 
+def _bucket_key_for_ip(addr: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> str:
+    if addr.version == 6:
+        # Collapse to the routed /64 so a caller with a prefix can't rotate
+        # the low bits to mint a fresh bucket per request.
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address)
+    return str(addr)
+
+
 def _client_id(request: Request) -> str:
-    """Best-effort per-caller key for the edge limiter.
+    """Best-effort per-caller key for the edge limiters.
 
     No authenticated identity reaches this module (auth happens in the host
     package that mounts these routes -- see the module docstring), so the
-    peer address Starlette resolved for the connection is the only signal
-    available here. Deliberately does not trust X-Forwarded-For/X-Real-IP:
-    this repo has no known trusted-proxy configuration, and trusting a
-    client-supplied header would let a caller mint an unlimited number of
-    fresh buckets just by varying it -- the exact bypass this limiter exists
-    to close for ``profile``.
+    caller's address is the only signal available here.
+
+    X-Forwarded-For is trusted only when CONDUIT_GEMINI_LIVE_TRUST_PROXY=1 is
+    set -- i.e. only when this dashboard is known to sit behind a reverse
+    proxy that overwrites/strips any client-supplied copy of that header
+    before it reaches here (same trust model as relay's TRUST_PROXY).
+    Without that, a caller could vary the header per request to mint an
+    unlimited number of fresh buckets, defeating the limiter entirely.
     """
+    if TRUST_PROXY:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        first_hop = forwarded.split(",", 1)[0].strip()
+        if first_hop:
+            try:
+                return _bucket_key_for_ip(ipaddress.ip_address(first_hop))
+            except ValueError:
+                pass  # not a valid address; fall through to the raw peer
     client = request.client
     if client is None or not client.host:
         return "unknown"
-    return client.host
+    try:
+        return _bucket_key_for_ip(ipaddress.ip_address(client.host))
+    except ValueError:
+        return client.host
 
 
 def _retry_after_header(retry_after_s: Optional[float]) -> Dict[str, str]:
@@ -330,7 +376,7 @@ def _retry_after_header(retry_after_s: Optional[float]) -> Dict[str, str]:
 @router.get("/gemini-live/status")
 async def get_gemini_live_status(request: Request, profile: Optional[str] = None) -> Dict[str, Any]:
     try:
-        _edge_limiter.acquire(_client_id(request))
+        _edge_status_limiter.acquire(_client_id(request))
         return {"ok": True, **(await _run_scoped(profile, gemini_live_status))}
     except TokenError as exc:
         raise HTTPException(
@@ -349,11 +395,10 @@ async def create_gemini_live_token(
     response.headers["Pragma"] = "no-cache"
     try:
         # Counted up front, before profile resolution, so it can't be dodged
-        # by probing with invalid/rotating profile names. Shares one bucket
-        # with /status per caller (_client_id) rather than a separate
-        # bucket per route, capping a caller's overall use of the Gemini
-        # Live edge surface, not each endpoint independently.
-        _edge_limiter.acquire(_client_id(request))
+        # by probing with invalid/rotating profile names. Uses its own
+        # per-caller budget, independent of /status's, so routine status
+        # polling can't consume the allowance a client needs to mint tokens.
+        _edge_token_limiter.acquire(_client_id(request))
         result = await _run_scoped(profile, lambda: mint_gemini_live_token(limiter_key=profile or ""))
     except TokenError as exc:
         logger.warning("Gemini Live token request failed: %s", exc)

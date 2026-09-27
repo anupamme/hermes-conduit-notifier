@@ -94,7 +94,12 @@ def client(monkeypatch):
     monkeypatch.setattr(api, "_env_value", lambda key: {"GEMINI_API_KEY": "secret"}.get(key))
     monkeypatch.setattr(api, "_post_json", lambda url, key, body: {"name": "auth_tokens/xyz"})
     monkeypatch.setattr(api, "_mint_limiter", api._MintLimiter(api.MINT_LIMIT, api.MINT_WINDOW_S))
-    monkeypatch.setattr(api, "_edge_limiter", api._MintLimiter(api._EDGE_LIMIT, api._EDGE_WINDOW_S))
+    monkeypatch.setattr(
+        api, "_edge_status_limiter", api._MintLimiter(api._EDGE_STATUS_LIMIT, api._EDGE_STATUS_WINDOW_S)
+    )
+    monkeypatch.setattr(
+        api, "_edge_token_limiter", api._MintLimiter(api._EDGE_TOKEN_LIMIT, api._EDGE_TOKEN_WINDOW_S)
+    )
     app = FastAPI()
     app.include_router(api.router, prefix="/api/plugins/conduit_push")
     return TestClient(app)
@@ -131,7 +136,9 @@ def test_token_route_rate_limits_per_profile(client, monkeypatch):
 
 def test_mint_limiter_frees_slots_after_the_window():
     now = [0.0]
-    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0])
+    # Force eager sweeping (as if unconditional) so this test still exercises
+    # the stale-bucket prune directly; gating behavior has its own test below.
+    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0], sweep_size_threshold=0, sweep_interval_s=0)
     limiter.acquire("default")
     with pytest.raises(api.TokenError) as raised:
         limiter.acquire("default")
@@ -152,25 +159,56 @@ def test_mint_limiter_reports_retry_after_on_429():
     assert raised.value.retry_after_s == pytest.approx(45.0)
 
 
+class FakeHeaders(dict):
+    def get(self, key, default=None):
+        return super().get(key.lower(), default)
+
+
+class FakeClient:
+    def __init__(self, host):
+        self.host = host
+
+
+class FakeRequest:
+    def __init__(self, client_host=None, headers=None):
+        self.client = FakeClient(client_host) if client_host is not None else None
+        self.headers = FakeHeaders(headers or {})
+
+
 def test_client_id_uses_the_peer_host():
-    class FakeClient:
-        host = "203.0.113.5"
-
-    class FakeRequest:
-        client = FakeClient()
-
-    assert api._client_id(FakeRequest()) == "203.0.113.5"
+    assert api._client_id(FakeRequest(client_host="203.0.113.5")) == "203.0.113.5"
 
 
 def test_client_id_falls_back_when_transport_has_no_peer_info():
-    class FakeRequest:
-        client = None
+    assert api._client_id(FakeRequest(client_host=None)) == "unknown"
 
-    assert api._client_id(FakeRequest()) == "unknown"
+
+def test_client_id_ignores_forwarded_header_by_default(monkeypatch):
+    monkeypatch.setattr(api, "TRUST_PROXY", False)
+    request = FakeRequest(client_host="203.0.113.5", headers={"x-forwarded-for": "198.51.100.9"})
+    assert api._client_id(request) == "203.0.113.5"
+
+
+def test_client_id_trusts_forwarded_header_when_enabled(monkeypatch):
+    monkeypatch.setattr(api, "TRUST_PROXY", True)
+    request = FakeRequest(client_host="203.0.113.5", headers={"x-forwarded-for": "198.51.100.9, 203.0.113.5"})
+    assert api._client_id(request) == "198.51.100.9"
+
+
+def test_client_id_falls_back_when_forwarded_header_is_invalid(monkeypatch):
+    monkeypatch.setattr(api, "TRUST_PROXY", True)
+    request = FakeRequest(client_host="203.0.113.5", headers={"x-forwarded-for": "not-an-ip"})
+    assert api._client_id(request) == "203.0.113.5"
+
+
+def test_client_id_normalizes_ipv6_to_a_64_prefix():
+    first = api._client_id(FakeRequest(client_host="2001:db8:1234:5678:aaaa::1"))
+    second = api._client_id(FakeRequest(client_host="2001:db8:1234:5678:bbbb::2"))
+    assert first == second == "2001:db8:1234:5678::"
 
 
 def test_edge_limiter_isolates_by_caller(client, monkeypatch):
-    monkeypatch.setattr(api, "_edge_limiter", api._MintLimiter(1, 60.0))
+    monkeypatch.setattr(api, "_edge_status_limiter", api._MintLimiter(1, 60.0))
     ids = iter(["client-a", "client-a", "client-b"])
     monkeypatch.setattr(api, "_client_id", lambda request: next(ids))
 
@@ -184,50 +222,89 @@ def test_edge_limiter_isolates_by_caller(client, monkeypatch):
     assert third.status_code == 200
 
 
-def test_status_and_token_share_the_same_edge_budget(client, monkeypatch):
-    monkeypatch.setattr(api, "_edge_limiter", api._MintLimiter(1, 60.0))
+def test_status_and_token_have_independent_edge_budgets(client, monkeypatch):
+    monkeypatch.setattr(api, "_edge_status_limiter", api._MintLimiter(1, 60.0))
+    monkeypatch.setattr(api, "_edge_token_limiter", api._MintLimiter(1, 60.0))
     monkeypatch.setattr(api, "_client_id", lambda request: "same-caller")
 
     status = client.get("/api/plugins/conduit_push/gemini-live/status")
     token = client.post("/api/plugins/conduit_push/gemini-live/token")
 
+    # Exhausting /status's budget doesn't touch /token's, and vice versa.
     assert status.status_code == 200
-    # Same caller, same bucket: the /status call already spent the budget.
-    assert token.status_code == 429
+    assert token.status_code == 200
+    assert client.get("/api/plugins/conduit_push/gemini-live/status").status_code == 429
+    assert client.post("/api/plugins/conduit_push/gemini-live/token").status_code == 429
 
 
-def test_edge_limit_429_sets_retry_after_header(client, monkeypatch):
+def test_status_429_message_does_not_mention_tokens(client, monkeypatch):
+    monkeypatch.setattr(api, "_edge_status_limiter", api._MintLimiter(1, 60.0))
+    client.get("/api/plugins/conduit_push/gemini-live/status")
+    response = client.get("/api/plugins/conduit_push/gemini-live/status")
+    assert response.status_code == 429
+    assert "token" not in response.json()["detail"].lower()
+
+
+def test_edge_status_limit_429_sets_retry_after_header(client, monkeypatch):
     now = [0.0]
-    monkeypatch.setattr(api, "_edge_limiter", api._MintLimiter(1, 60.0, clock=lambda: now[0]))
-    monkeypatch.setattr(api, "_client_id", lambda request: "same-caller")
+    monkeypatch.setattr(api, "_edge_status_limiter", api._MintLimiter(1, 60.0, clock=lambda: now[0]))
 
     assert client.get("/api/plugins/conduit_push/gemini-live/status").status_code == 200
 
     now[0] = 10.0
-    status_response = client.get("/api/plugins/conduit_push/gemini-live/status")
-    assert status_response.status_code == 429
-    assert status_response.headers["retry-after"] == "50"  # ceil(60 - 10)
-
-    token_response = client.post("/api/plugins/conduit_push/gemini-live/token")
-    assert token_response.status_code == 429
-    assert token_response.headers["retry-after"] == "50"
-    assert token_response.headers["cache-control"] == "no-store"
+    response = client.get("/api/plugins/conduit_push/gemini-live/status")
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "50"  # ceil(60 - 10)
 
 
-def test_edge_limit_configurable_via_env_vars(monkeypatch):
-    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_LIMIT", "5")
-    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_WINDOW_S", "30")
+def test_edge_token_limit_429_sets_retry_after_and_no_store_header(client, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(api, "_edge_token_limiter", api._MintLimiter(1, 60.0, clock=lambda: now[0]))
+
+    assert client.post("/api/plugins/conduit_push/gemini-live/token").status_code == 200
+
+    now[0] = 10.0
+    response = client.post("/api/plugins/conduit_push/gemini-live/token")
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "50"
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_edge_limits_configurable_via_env_vars(monkeypatch):
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_STATUS_LIMIT", "5")
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_STATUS_WINDOW_S", "30")
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_TOKEN_LIMIT", "7")
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_TOKEN_WINDOW_S", "45")
     module = _load_plugin_api()
-    assert module._EDGE_LIMIT == 5
-    assert module._EDGE_WINDOW_S == 30.0
+    assert module._EDGE_STATUS_LIMIT == 5
+    assert module._EDGE_STATUS_WINDOW_S == 30.0
+    assert module._EDGE_TOKEN_LIMIT == 7
+    assert module._EDGE_TOKEN_WINDOW_S == 45.0
 
 
 def test_edge_limit_env_vars_fall_back_to_defaults_on_invalid_value(monkeypatch):
-    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_LIMIT", "not-a-number")
-    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_WINDOW_S", "-5")
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_STATUS_LIMIT", "not-a-number")
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_STATUS_WINDOW_S", "-5")
     module = _load_plugin_api()
-    assert module._EDGE_LIMIT == module.DEFAULT_EDGE_LIMIT
-    assert module._EDGE_WINDOW_S == module.DEFAULT_EDGE_WINDOW_S
+    assert module._EDGE_STATUS_LIMIT == module.DEFAULT_EDGE_STATUS_LIMIT
+    assert module._EDGE_STATUS_WINDOW_S == module.DEFAULT_EDGE_STATUS_WINDOW_S
+
+
+def test_mint_limiter_only_sweeps_once_size_and_interval_thresholds_are_met():
+    now = [0.0]
+    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0], sweep_size_threshold=1, sweep_interval_s=10.0)
+    limiter.acquire("a")
+    now[0] = 100.0  # "a" is now stale (age 100 >= window 60)
+    limiter.acquire("b")
+    # len(_mints) was 1 (only "a") when acquiring "b", so "1 > 1" is False:
+    # the gate holds even though "a" is stale and the interval has passed.
+    assert set(limiter._mints) == {"a", "b"}
+    now[0] = 200.0  # both "a" and "b" are now stale
+    limiter.acquire("c")
+    # len(_mints) was 2 when acquiring "c", so "2 > 1" is True, and the
+    # interval condition holds too: the gate opens and drops both stale
+    # entries.
+    assert set(limiter._mints) == {"c"}
 
 
 def test_requests_that_never_reach_google_do_not_use_the_mint_budget(client, monkeypatch):
