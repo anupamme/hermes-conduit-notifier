@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -146,7 +148,19 @@ def _outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     # remember. The flag is read at send time, so `redact on` covers events
     # already queued and `redact off` releases them unredacted: the switch
     # governs what leaves from the moment it is flipped.
-    return redact_event(event) if state.get("redact_content") else event
+    if not state.get("redact_content"):
+        return event
+    redacted = redact_event(event)
+    # Plain event ids are an unkeyed digest of hook data (for approvals,
+    # the command). Re-key them with this profile's relay credential: the
+    # relay still dedupes replays (same input -> same id) but can no longer
+    # dictionary-match the digest against guessed commands.
+    event_id = redacted.get("event_id")
+    if isinstance(event_id, str) and ":" in event_id:
+        prefix = event_id.split(":", 1)[0]
+        keyed = hmac.new(str(state.get("credential", "")).encode(), event_id.encode(), hashlib.sha256).hexdigest()[:32]
+        redacted["event_id"] = f"{prefix}:{keyed}"
+    return redacted
 
 
 def poll_decision(request_id: str) -> dict[str, Any]:

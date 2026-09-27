@@ -92,7 +92,8 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     structural fields the device needs to answer it (kind, session_key or
     request_id, qids, choices, multi_select), with its display text replaced
     by generic copy. Choice labels are kept because the answer is one of
-    them; an approval's are the fixed once/deny vocabulary. Returns a new
+    them; an approval's are filtered to the gateway's once/session/always/deny
+    vocabulary. Returns a new
     dict; the input is not mutated.
     """
     # Fail closed: both the event and its decision are rebuilt from explicit

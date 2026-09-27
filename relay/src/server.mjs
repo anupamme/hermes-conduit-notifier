@@ -473,6 +473,7 @@ function notificationFor(event, preferences, gateway = undefined) {
   // `!== false` keeps installations whose stored preferences predate
   // attention_sound on that default. completion_sound keeps its original
   // truthy test, so its behavior for any stored shape is unchanged.
+  // turn.failed is deliberately excluded: it reports, it doesn't wait on the user.
   const attention = event.type === 'approval.needed' || event.type === 'input.needed';
   const sound = (completion && preferences.completion_sound) || (attention && preferences.attention_sound !== false);
   // `decision` carries structured approval card content so Conduit can render
