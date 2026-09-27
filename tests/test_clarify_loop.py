@@ -759,3 +759,22 @@ def test_redacted_event_ids_are_keyed_but_stable(monkeypatch):
     assert sent[0]["event_id"] != event["event_id"]
     assert sent[0]["event_id"] != sent[2]["event_id"]
     assert sent[0]["event_id"].startswith("approval:")
+
+
+def test_set_redact_content_and_repairing_keep_the_flag(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("conduit_push._client_state_under_test", ROOT / "client.py")
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    monkeypatch.setattr(client, "state_path", lambda: tmp_path / "conduit-push.json")
+
+    assert client.set_redact_content(True) is False  # unpaired: nothing to configure
+
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: {"credential": "c", "installation_id": "i"})
+    client.claim_pairing("CODE")
+    assert client.set_redact_content(True) is True
+    assert client.load_state()["redact_content"] is True
+
+    client.claim_pairing("CODE")  # re-pair
+    assert client.load_state()["redact_content"] is True
+    client.set_redact_content(False)
+    assert not client.load_state().get("redact_content")

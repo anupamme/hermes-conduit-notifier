@@ -135,7 +135,7 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
 
 # The gateway's approval vocabulary (the relay whitelists the same set).
 _APPROVAL_CHOICES = ("once", "session", "always", "deny")
-_REDACTED_EVENT_KEYS = ("event_id", "type", "plugin_version", "plugin_capabilities", "session_id", "profile")
+_REDACTED_EVENT_KEYS = ("event_id", "type", "plugin_version", "plugin_capabilities", "session_id", "profile", "gateway")
 
 
 def approval_decision(*, session_key: str, description: str) -> dict[str, Any]:

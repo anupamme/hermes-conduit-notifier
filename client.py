@@ -76,6 +76,10 @@ def claim_pairing(code: str, relay_url: str = DEFAULT_RELAY_URL, gateway_name: s
         "installation_id": body["installation_id"],
         "relay_url": body.get("relay_url") or relay_url.rstrip("/"),
     }
+    # Re-pairing over an existing pairing must not silently drop the
+    # profile's privacy choice.
+    if (load_state() or {}).get("redact_content"):
+        state["redact_content"] = True
     save_state(state)
     return state
 
@@ -156,8 +160,8 @@ def _outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     # relay still dedupes replays (same input -> same id) but can no longer
     # dictionary-match the digest against guessed commands.
     event_id = redacted.get("event_id")
-    if isinstance(event_id, str) and ":" in event_id:
-        prefix = event_id.split(":", 1)[0]
+    if isinstance(event_id, str) and event_id:
+        prefix = event_id.split(":", 1)[0] if ":" in event_id else "event"
         keyed = hmac.new(str(state.get("credential", "")).encode(), event_id.encode(), hashlib.sha256).hexdigest()[:32]
         redacted["event_id"] = f"{prefix}:{keyed}"
     return redacted
