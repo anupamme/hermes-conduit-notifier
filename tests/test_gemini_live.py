@@ -94,6 +94,7 @@ def client(monkeypatch):
     monkeypatch.setattr(api, "_env_value", lambda key: {"GEMINI_API_KEY": "secret"}.get(key))
     monkeypatch.setattr(api, "_post_json", lambda url, key, body: {"name": "auth_tokens/xyz"})
     monkeypatch.setattr(api, "_mint_limiter", api._MintLimiter(api.MINT_LIMIT, api.MINT_WINDOW_S))
+    monkeypatch.setattr(api, "_edge_limiter", api._MintLimiter(api._EDGE_LIMIT, api._EDGE_WINDOW_S))
     app = FastAPI()
     app.include_router(api.router, prefix="/api/plugins/conduit_push")
     return TestClient(app)
@@ -139,6 +140,94 @@ def test_mint_limiter_frees_slots_after_the_window():
     now[0] = 60.0
     limiter.acquire("default")
     assert list(limiter._mints) == ["default"]
+
+
+def test_mint_limiter_reports_retry_after_on_429():
+    now = [10.0]
+    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0])
+    limiter.acquire("k")
+    now[0] = 25.0  # 15s into the 60s window
+    with pytest.raises(api.TokenError) as raised:
+        limiter.acquire("k")
+    assert raised.value.retry_after_s == pytest.approx(45.0)
+
+
+def test_client_id_uses_the_peer_host():
+    class FakeClient:
+        host = "203.0.113.5"
+
+    class FakeRequest:
+        client = FakeClient()
+
+    assert api._client_id(FakeRequest()) == "203.0.113.5"
+
+
+def test_client_id_falls_back_when_transport_has_no_peer_info():
+    class FakeRequest:
+        client = None
+
+    assert api._client_id(FakeRequest()) == "unknown"
+
+
+def test_edge_limiter_isolates_by_caller(client, monkeypatch):
+    monkeypatch.setattr(api, "_edge_limiter", api._MintLimiter(1, 60.0))
+    ids = iter(["client-a", "client-a", "client-b"])
+    monkeypatch.setattr(api, "_client_id", lambda request: next(ids))
+
+    first = client.get("/api/plugins/conduit_push/gemini-live/status")
+    second = client.get("/api/plugins/conduit_push/gemini-live/status")
+    third = client.get("/api/plugins/conduit_push/gemini-live/status")
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    # A different caller is unaffected by client-a's exhausted budget.
+    assert third.status_code == 200
+
+
+def test_status_and_token_share_the_same_edge_budget(client, monkeypatch):
+    monkeypatch.setattr(api, "_edge_limiter", api._MintLimiter(1, 60.0))
+    monkeypatch.setattr(api, "_client_id", lambda request: "same-caller")
+
+    status = client.get("/api/plugins/conduit_push/gemini-live/status")
+    token = client.post("/api/plugins/conduit_push/gemini-live/token")
+
+    assert status.status_code == 200
+    # Same caller, same bucket: the /status call already spent the budget.
+    assert token.status_code == 429
+
+
+def test_edge_limit_429_sets_retry_after_header(client, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(api, "_edge_limiter", api._MintLimiter(1, 60.0, clock=lambda: now[0]))
+    monkeypatch.setattr(api, "_client_id", lambda request: "same-caller")
+
+    assert client.get("/api/plugins/conduit_push/gemini-live/status").status_code == 200
+
+    now[0] = 10.0
+    status_response = client.get("/api/plugins/conduit_push/gemini-live/status")
+    assert status_response.status_code == 429
+    assert status_response.headers["retry-after"] == "50"  # ceil(60 - 10)
+
+    token_response = client.post("/api/plugins/conduit_push/gemini-live/token")
+    assert token_response.status_code == 429
+    assert token_response.headers["retry-after"] == "50"
+    assert token_response.headers["cache-control"] == "no-store"
+
+
+def test_edge_limit_configurable_via_env_vars(monkeypatch):
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_LIMIT", "5")
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_WINDOW_S", "30")
+    module = _load_plugin_api()
+    assert module._EDGE_LIMIT == 5
+    assert module._EDGE_WINDOW_S == 30.0
+
+
+def test_edge_limit_env_vars_fall_back_to_defaults_on_invalid_value(monkeypatch):
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_LIMIT", "not-a-number")
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_WINDOW_S", "-5")
+    module = _load_plugin_api()
+    assert module._EDGE_LIMIT == module.DEFAULT_EDGE_LIMIT
+    assert module._EDGE_WINDOW_S == module.DEFAULT_EDGE_WINDOW_S
 
 
 def test_requests_that_never_reach_google_do_not_use_the_mint_budget(client, monkeypatch):
