@@ -1,0 +1,10 @@
+{
+  "name": "conduit_push",
+  "label": "Conduit",
+  "description": "Routes the Hermes Conduit iOS app calls on this host (Gemini Live session tokens).",
+  "icon": "Puzzle",
+  "version": "0.3.0",
+  "tab": { "path": "/conduit", "hidden": true },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

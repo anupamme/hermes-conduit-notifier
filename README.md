@@ -2,7 +2,7 @@
 
 Hermes Conduit Notifier is the open-source Hermes plugin that delivers lifecycle notifications to the Hermes Conduit iOS app. It observes normal Hermes hooks and sends small HTTPS events to the Conduit push relay.
 
-The plugin does **not** contain an Apple Push Notification service key, dashboard credentials, or access to your Hermes gateway. Apple credentials remain on the central push relay, so self-hosted users never need to copy a shared signing key onto their gateway.
+The plugin does **not** contain an Apple Push Notification service key, dashboard credentials, or access to your Hermes gateway. (Its only dashboard routes hand Conduit short-lived Gemini Live tokens; see below.) Apple credentials remain on the central push relay, so self-hosted users never need to copy a shared signing key onto their gateway.
 
 ## Install
 
@@ -186,6 +186,33 @@ call; the plugin then releases the parked decision (`DELETE
 /v1/decisions/:id`) so late device answers are rejected rather than
 reported as accepted. A batch answered partly natively and partly by relay
 stays open until the gateway's configured clarify timeout bounds it.
+
+## Gemini Live tokens
+
+Conduit's Gemini Live voice mode talks to Google directly from the phone, but
+the Gemini API key stays on your Hermes host. The plugin adds two routes to the
+Hermes dashboard, behind the dashboard's normal auth:
+
+| Method | Path | Returns |
+|--------|------|---------|
+| GET | `/api/plugins/conduit_push/gemini-live/status` | `{ok, available, reason?, model}` |
+| POST | `/api/plugins/conduit_push/gemini-live/token` | `{ok, token, expires_at, new_session_expires_at, model, websocket_url}` |
+
+Set the key in the profile's `.env` (the same key Hermes' Gemini TTS uses):
+
+```bash
+GEMINI_API_KEY=...        # or GOOGLE_API_KEY
+CONDUIT_GEMINI_LIVE_MODEL=gemini-3.8-live   # optional override
+CONDUIT_GEMINI_LIVE_API_VERSION=v1alpha      # optional; ephemeral tokens are v1alpha today
+```
+
+Each token is a Google ephemeral token: one use, locked to that model, valid
+for 30 minutes, and it must open its Live session within a minute. Conduit
+asks for a fresh token for every connection, capped at 20 per minute per
+profile. The API key itself is never returned or logged. `?profile=<name>` resolves another profile's key, as the
+`/api/audio/*` routes do, and fails with 503 rather than falling back to the
+default profile if it can't. Restart the dashboard (`hermes gateway restart`)
+after updating the plugin so the routes mount.
 
 ## Conduit support and privacy
 
