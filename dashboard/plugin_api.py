@@ -31,11 +31,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 DEFAULT_MODEL = "gemini-3.8-live"
-TOKEN_URL = "https://generativelanguage.googleapis.com/v1beta/auth_tokens"
-WEBSOCKET_URL = (
-    "wss://generativelanguage.googleapis.com/ws/"
-    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"
-)
+# Ephemeral tokens are served on v1alpha only (google-genai 2.25 pins it and
+# warns on anything else); the env override covers a later v1beta rollout.
+DEFAULT_API_VERSION = "v1alpha"
+API_VERSION_ENV_VAR = "CONDUIT_GEMINI_LIVE_API_VERSION"
 # Same lookup order as Hermes' Gemini TTS provider.
 API_KEY_ENV_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 MODEL_ENV_VAR = "CONDUIT_GEMINI_LIVE_MODEL"
@@ -78,6 +77,22 @@ def resolve_model(get_env: Callable[[str], Optional[str]] = _env_value) -> str:
     return value.removeprefix("models/") or DEFAULT_MODEL
 
 
+def resolve_api_version(get_env: Callable[[str], Optional[str]] = _env_value) -> str:
+    value = str(get_env(API_VERSION_ENV_VAR) or "").strip()
+    return value if value in ("v1alpha", "v1beta", "v1") else DEFAULT_API_VERSION
+
+
+def token_url(api_version: str) -> str:
+    return f"https://generativelanguage.googleapis.com/{api_version}/auth_tokens"
+
+
+def websocket_url(api_version: str) -> str:
+    return (
+        "wss://generativelanguage.googleapis.com/ws/"
+        f"google.ai.generativelanguage.{api_version}.GenerativeService.BidiGenerateContentConstrained"
+    )
+
+
 def _timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -87,9 +102,11 @@ def token_request_body(model: str, now: datetime) -> Dict[str, Any]:
         "uses": 1,
         "expireTime": _timestamp(now + TOKEN_LIFETIME),
         "newSessionExpireTime": _timestamp(now + NEW_SESSION_WINDOW),
-        # Lock the model only: Conduit sends its own tools and instructions in
-        # the session setup.
-        "liveConnectConstraints": {"model": f"models/{model}"},
+        # The auth-token service takes the Live setup under this name (the SDK's
+        # live_connect_constraints). fieldMask locks only the model; without it
+        # Google locks the whole setup and Conduit couldn't send its tools.
+        "bidiGenerateContentSetup": {"model": f"models/{model}"},
+        "fieldMask": "model",
     }
 
 
@@ -150,8 +167,9 @@ def mint_gemini_live_token(
         _mint_limiter.acquire(limiter_key)
     model = resolve_model(get_env)
     now = now or datetime.now(timezone.utc)
+    api_version = resolve_api_version(get_env)
     body = token_request_body(model, now)
-    payload = post(TOKEN_URL, api_key, body)
+    payload = post(token_url(api_version), api_key, body)
     token = payload.get("name") if isinstance(payload, dict) else None
     if not isinstance(token, str) or not token:
         raise TokenError(502, "Google's token response had no token")
@@ -160,7 +178,7 @@ def mint_gemini_live_token(
         "expires_at": body["expireTime"],
         "new_session_expires_at": body["newSessionExpireTime"],
         "model": model,
-        "websocket_url": WEBSOCKET_URL,
+        "websocket_url": websocket_url(api_version),
     }
 
 

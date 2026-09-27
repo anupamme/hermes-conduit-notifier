@@ -203,6 +203,7 @@ Set the key in the profile's `.env` (the same key Hermes' Gemini TTS uses):
 ```bash
 GEMINI_API_KEY=...        # or GOOGLE_API_KEY
 CONDUIT_GEMINI_LIVE_MODEL=gemini-3.8-live   # optional override
+CONDUIT_GEMINI_LIVE_API_VERSION=v1alpha      # optional; ephemeral tokens are v1alpha today
 ```
 
 Each token is a Google ephemeral token: one use, locked to that model, valid

@@ -57,20 +57,22 @@ def test_token_is_single_use_model_locked_and_short_lived():
     result = api.mint_gemini_live_token(env(GEMINI_API_KEY="secret"), post, now=NOW)
 
     url, key, body = calls[0]
-    assert url == api.TOKEN_URL
+    assert url == "https://generativelanguage.googleapis.com/v1alpha/auth_tokens"
     assert key == "secret"
     assert body == {
         "uses": 1,
         "expireTime": "2026-09-27T12:30:00Z",
         "newSessionExpireTime": "2026-09-27T12:01:00Z",
-        "liveConnectConstraints": {"model": "models/gemini-3.8-live"},
+        "bidiGenerateContentSetup": {"model": "models/gemini-3.8-live"},
+        "fieldMask": "model",
     }
     assert result == {
         "token": "auth_tokens/abc123",
         "expires_at": "2026-09-27T12:30:00Z",
         "new_session_expires_at": "2026-09-27T12:01:00Z",
         "model": "gemini-3.8-live",
-        "websocket_url": api.WEBSOCKET_URL,
+        "websocket_url": "wss://generativelanguage.googleapis.com/ws/"
+        "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained",
     }
     assert "secret" not in json.dumps(result)
 
@@ -157,7 +159,7 @@ def test_google_http_error_becomes_a_502_without_the_key(monkeypatch):
 
     monkeypatch.setattr(api._opener, "open", fail)
     with pytest.raises(api.TokenError) as raised:
-        api._post_json(api.TOKEN_URL, "secret", {})
+        api._post_json(api.token_url("v1alpha"), "secret", {})
     assert raised.value.status == 502
     assert "API key not valid" in str(raised.value)
     assert "secret" not in str(raised.value)
@@ -172,3 +174,16 @@ def test_token_route_maps_failures_to_http_status(client, monkeypatch):
     response = client.post("/api/plugins/conduit_push/gemini-live/token")
     assert response.status_code == 503
     assert "GEMINI_API_KEY" in response.json()["detail"]
+
+
+def test_api_version_override_moves_both_urls():
+    calls = []
+    result = api.mint_gemini_live_token(
+        env(GEMINI_API_KEY="secret", CONDUIT_GEMINI_LIVE_API_VERSION="v1beta"),
+        lambda url, key, body: calls.append(url) or {"name": "auth_tokens/t"}, now=NOW)
+    assert calls == ["https://generativelanguage.googleapis.com/v1beta/auth_tokens"]
+    assert ".v1beta.GenerativeService." in result["websocket_url"]
+
+
+def test_unknown_api_version_falls_back_to_v1alpha():
+    assert api.resolve_api_version(env(CONDUIT_GEMINI_LIVE_API_VERSION="../evil")) == "v1alpha"
