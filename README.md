@@ -60,7 +60,7 @@ The plugin currently emits notifications for:
 
 An exact `[Silent]` assistant response does not emit a completion notification.
 
-The iOS app controls which categories are enabled, whether notification previews are shown, and whether completion sounds play.
+The iOS app controls which categories are enabled, whether notification previews are shown, whether completion sounds play, and whether approval and input-needed notifications play a sound (on by default).
 
 ## Privacy and security
 

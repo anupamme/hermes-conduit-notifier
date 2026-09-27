@@ -473,7 +473,7 @@ function notificationFor(event, preferences, gateway = undefined) {
   // `!== false` keeps installations whose stored preferences predate the
   // key on that default.
   const attention = event.type === 'approval.needed' || event.type === 'input.needed';
-  const sound = (completion && preferences.completion_sound) || (attention && preferences.attention_sound !== false);
+  const sound = (completion && preferences.completion_sound !== false) || (attention && preferences.attention_sound !== false);
   // `decision` carries structured approval card content so Conduit can render
   // an answerable card from the push payload alone — the one-shot gateway
   // stream event is missed while the app is backgrounded. It has its own
