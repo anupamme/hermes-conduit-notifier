@@ -15,7 +15,7 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 
-from .events import PLUGIN_VERSION
+from .events import PLUGIN_VERSION, redact_event
 
 
 DEFAULT_RELAY_URL = "https://push.milim.dev"
@@ -102,11 +102,12 @@ def enqueue(event: dict[str, Any]) -> bool:
     on this event, so a drop has to fall back to the native clarify path
     instead of polling an answer that can never arrive.
     """
-    if not load_state():
+    state = load_state()
+    if not state:
         return False
     _start_worker()
     try:
-        _events.put_nowait(event)
+        _events.put_nowait(_outgoing(event, state))
     except queue.Full:
         logger.warning("Conduit notification queue is full; dropping %s", event.get("type", "event"))
         return False
@@ -121,9 +122,24 @@ def send_now(event: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
         f"{state['relay_url'].rstrip('/')}/v1/events",
         method="POST",
         credential=state["credential"],
-        payload=event,
+        payload=_outgoing(event, state),
         timeout=timeout,
     )
+
+
+def set_redact_content(enabled: bool) -> None:
+    """Persist this profile's content-redaction switch (#192)."""
+    state = load_state()
+    if not state:
+        raise RuntimeError("This Hermes profile is not paired with Conduit.")
+    state["redact_content"] = bool(enabled)
+    save_state(state)
+
+
+def _outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    # Redaction happens at the one egress chokepoint, so every hook and the
+    # clarify loop get it without each builder having to remember.
+    return redact_event(event) if state.get("redact_content") else event
 
 
 def poll_decision(request_id: str) -> dict[str, Any]:

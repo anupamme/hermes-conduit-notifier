@@ -80,6 +80,39 @@ def push_event(
     return event
 
 
+REDACTED_APPROVAL_TEXT = "Hermes needs your approval. Open Conduit for details."
+REDACTED_QUESTION_TEXT = "Hermes needs your answer. Open Conduit for details."
+
+
+def redact_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Strip chat content from an outgoing event, keeping answer routing.
+
+    For profiles that opt into `hermes conduit-push redact on` (#192): no
+    title/body text leaves the gateway, and a decision keeps only the
+    structural fields the device needs to answer it (kind, session_key or
+    request_id, qids, choices, multi_select), with its display text replaced
+    by generic copy. Choice labels are kept because the answer is one of
+    them; an approval's are the fixed once/deny vocabulary. Returns a new
+    dict; the input is not mutated.
+    """
+    redacted = {key: value for key, value in event.items() if key not in ("title", "body")}
+    decision = event.get("decision")
+    if isinstance(decision, dict):
+        decision = dict(decision)
+        if decision.get("kind") == "approval":
+            decision["description"] = REDACTED_APPROVAL_TEXT
+        elif decision.get("kind") == "clarify":
+            decision["question"] = REDACTED_QUESTION_TEXT
+            questions = decision.get("questions")
+            if isinstance(questions, list):
+                decision["questions"] = [
+                    {**entry, "question": f"Question {index + 1}"} if isinstance(entry, dict) else entry
+                    for index, entry in enumerate(questions)
+                ]
+        redacted["decision"] = decision
+    return redacted
+
+
 def approval_decision(*, session_key: str, description: str) -> dict[str, Any]:
     """Build the structured payload for an approval notification.
 

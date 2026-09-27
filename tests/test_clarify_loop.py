@@ -705,3 +705,18 @@ def test_user_agent_derives_from_the_plugin_version():
     # automatically instead of leaving a stale hand-written constant.
     assert loop.client.USER_AGENT == f"Hermes-Conduit-Notifier/{loop.client.PLUGIN_VERSION}"
     assert loop.client.PLUGIN_VERSION == "0.3.0"
+
+
+def test_send_now_redacts_only_when_the_profile_opts_in(monkeypatch):
+    client = loop.client
+    sent = []
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
+    event = {"event_id": "approval:12345678", "type": "approval.needed", "body": "Run rm -rf build"}
+
+    monkeypatch.setattr(client, "load_state", lambda: {"relay_url": "https://relay", "credential": "x"})
+    client.send_now(event)
+    monkeypatch.setattr(client, "load_state", lambda: {"relay_url": "https://relay", "credential": "x", "redact_content": True})
+    client.send_now(event)
+
+    assert sent[0]["body"] == "Run rm -rf build"
+    assert "body" not in sent[1]

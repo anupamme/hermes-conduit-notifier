@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import socket
 
-from .client import DEFAULT_RELAY_URL, claim_pairing, load_state, send_now, state_path, unpair
+from .client import DEFAULT_RELAY_URL, claim_pairing, load_state, send_now, set_redact_content, state_path, unpair
 from .events import event_id, plugin_hello, push_event
 
 
@@ -18,6 +18,11 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     commands.add_parser("status", help="Show pairing status without revealing credentials")
     commands.add_parser("test", help="Send a test notification to the paired device")
     commands.add_parser("unpair", help="Revoke this profile's relay credential")
+    redact = commands.add_parser(
+        "redact",
+        help="Keep chat text off the relay; cards stay answerable with generic text",
+    )
+    redact.add_argument("mode", choices=["on", "off"])
     parser.set_defaults(func=dispatch)
 
 
@@ -40,6 +45,7 @@ def dispatch(args: argparse.Namespace) -> int:
             return 1
         print(f"Paired: {state.get('gateway_name') or socket.gethostname()}")
         print(f"Relay: {state.get('relay_url') or DEFAULT_RELAY_URL}")
+        print(f"Redact content: {'on' if state.get('redact_content') else 'off'}")
         print(f"State: {state_path()}")
         return 0
     if action == "test":
@@ -52,10 +58,18 @@ def dispatch(args: argparse.Namespace) -> int:
         ))
         print("Test notification accepted by the Conduit relay.")
         return 0
+    if action == "redact":
+        set_redact_content(args.mode == "on")
+        print(
+            "Notification content is redacted; approval and clarify cards use generic text."
+            if args.mode == "on"
+            else "Notification content is no longer redacted."
+        )
+        return 0
     if action == "unpair":
         print("Conduit pairing revoked." if unpair() else "This Hermes profile was not paired.")
         return 0
-    print("Usage: hermes conduit-push {pair|status|test|unpair}")
+    print("Usage: hermes conduit-push {pair|status|test|redact|unpair}")
     return 2
 
 
