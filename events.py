@@ -105,14 +105,15 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     redacted = {key: event[key] for key in _REDACTED_EVENT_KEYS if key in event}
     decision = sanitize_decision(event.get("decision")) if event.get("decision") is not None else {}
     if decision.get("kind") == "approval":
+        # Unknown labels never transit; fall back to the always-valid subset
+        # (see approval_decision) so the card stays answerable.
         choices = [choice for choice in decision.get("choices", []) if choice in _APPROVAL_CHOICES]
-        if choices:
-            redacted["decision"] = {
-                "kind": "approval",
-                "description": REDACTED_APPROVAL_TEXT,
-                "session_key": decision["session_key"],
-                "choices": choices,
-            }
+        redacted["decision"] = {
+            "kind": "approval",
+            "description": REDACTED_APPROVAL_TEXT,
+            "session_key": decision["session_key"],
+            "choices": choices or ["once", "deny"],
+        }
     elif decision.get("kind") == "clarify":
         clarify: dict[str, Any] = {
             "kind": "clarify",

@@ -752,8 +752,8 @@ def test_redacted_event_ids_are_keyed_but_stable(monkeypatch):
     sent = []
     monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
     event = {"event_id": "approval:0123456789abcdef0123456789abcdef", "type": "approval.needed"}
-    for credential in ("a", "a", "b"):
-        monkeypatch.setattr(client, "load_state", lambda c=credential: {"relay_url": "https://relay", "credential": c, "redact_content": True})
+    for key in ("a", "a", "b"):
+        monkeypatch.setattr(client, "load_state", lambda k=key: {"relay_url": "https://relay", "credential": "c", "redact_content": True, "redact_key": k})
         client.send_now(event)
     assert sent[0]["event_id"] == sent[1]["event_id"]  # replays still dedupe
     assert sent[0]["event_id"] != event["event_id"]
@@ -773,8 +773,11 @@ def test_set_redact_content_and_repairing_keep_the_flag(monkeypatch, tmp_path):
     client.claim_pairing("CODE")
     assert client.set_redact_content(True) is True
     assert client.load_state()["redact_content"] is True
+    key = client.load_state()["redact_key"]
+    assert key and key != "c"
 
     client.claim_pairing("CODE")  # re-pair
     assert client.load_state()["redact_content"] is True
+    assert client.load_state()["redact_key"] == key
     client.set_redact_content(False)
     assert not client.load_state().get("redact_content")

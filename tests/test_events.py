@@ -417,6 +417,8 @@ def test_redact_event_drops_unknown_keys_at_every_level():
 def test_redact_event_applies_sanitizer_and_approval_vocabulary():
     approval = redact_event({"decision": {"kind": "approval", "session_key": "s", "description": "x", "choices": ["Run rm -rf / secret", "deny"]}})
     assert approval["decision"]["choices"] == ["deny"]
+    fallback = redact_event({"decision": {"kind": "approval", "session_key": "s", "description": "x", "choices": ["secret"]}})
+    assert fallback["decision"]["choices"] == ["once", "deny"]
     assert "secret" not in json.dumps(approval)
     clarify = redact_event({"decision": {"kind": "clarify", "request_id": "r", "question": "q", "questions": [
         {"qid": "__proto__", "question": "q", "choices": ["a"]},

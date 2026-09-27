@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import secrets
 import socket
 import threading
 import urllib.error
@@ -78,8 +79,11 @@ def claim_pairing(code: str, relay_url: str = DEFAULT_RELAY_URL, gateway_name: s
     }
     # Re-pairing over an existing pairing must not silently drop the
     # profile's privacy choice.
-    if (load_state() or {}).get("redact_content"):
+    previous = load_state() or {}
+    if previous.get("redact_content"):
         state["redact_content"] = True
+        if previous.get("redact_key"):
+            state["redact_key"] = previous["redact_key"]
     save_state(state)
     return state
 
@@ -141,6 +145,9 @@ def set_redact_content(enabled: bool) -> bool:
     if not state:
         return False
     state["redact_content"] = bool(enabled)
+    if enabled and not state.get("redact_key"):
+        # Local-only key for re-keying event ids; never sent to the relay.
+        state["redact_key"] = secrets.token_hex(32)
     save_state(state)
     return True
 
@@ -156,13 +163,14 @@ def _outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         return event
     redacted = redact_event(event)
     # Plain event ids are an unkeyed digest of hook data (for approvals,
-    # the command). Re-key them with this profile's relay credential: the
-    # relay still dedupes replays (same input -> same id) but can no longer
-    # dictionary-match the digest against guessed commands.
+    # the command). Re-key them with a local-only secret the relay never
+    # receives: it still dedupes replays (same input -> same id) but cannot
+    # recompute the digest for guessed commands. Runs once per event at this
+    # chokepoint; the output is not meant to be fed back in.
     event_id = redacted.get("event_id")
     if isinstance(event_id, str) and event_id:
         prefix = event_id.split(":", 1)[0] if ":" in event_id else "event"
-        keyed = hmac.new(str(state.get("credential", "")).encode(), event_id.encode(), hashlib.sha256).hexdigest()[:32]
+        keyed = hmac.new(str(state.get("redact_key") or secrets.token_hex(32)).encode(), event_id.encode(), hashlib.sha256).hexdigest()[:32]
         redacted["event_id"] = f"{prefix}:{keyed}"
     return redacted
 
