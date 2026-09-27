@@ -138,12 +138,16 @@ def mint_gemini_live_token(
     get_env: Optional[Callable[[str], Optional[str]]] = None,
     post: Optional[Callable[[str, str, Dict[str, Any]], Dict[str, Any]]] = None,
     now: Optional[datetime] = None,
+    limiter_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     get_env = get_env or _env_value
     post = post or _post_json
     api_key = resolve_api_key(get_env)
     if api_key is None:
         raise TokenError(503, "GEMINI_API_KEY is not set on this Hermes host")
+    if limiter_key is not None:
+        # Counted only once the profile resolved and has a key, i.e. for requests that reach Google.
+        _mint_limiter.acquire(limiter_key)
     model = resolve_model(get_env)
     now = now or datetime.now(timezone.utc)
     body = token_request_body(model, now)
@@ -173,6 +177,9 @@ class _MintLimiter:
     def acquire(self, key: str) -> None:
         now = self.clock()
         with self._lock:
+            # Drop buckets whose newest mint has aged out, so idle keys don't pile up.
+            for stale in [k for k, q in self._mints.items() if now - q[-1] >= self.window_s]:
+                del self._mints[stale]
             mints = self._mints.setdefault(key, deque())
             while mints and now - mints[0] >= self.window_s:
                 mints.popleft()
@@ -222,8 +229,7 @@ async def create_gemini_live_token(response: Response, profile: Optional[str] = 
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     try:
-        _mint_limiter.acquire(profile or "")
-        result = await _run_scoped(profile, mint_gemini_live_token)
+        result = await _run_scoped(profile, lambda: mint_gemini_live_token(limiter_key=profile or ""))
     except TokenError as exc:
         logger.warning("Gemini Live token request failed: %s", exc)
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})

@@ -136,6 +136,15 @@ def test_mint_limiter_frees_slots_after_the_window():
     limiter.acquire("coder")
     now[0] = 60.0
     limiter.acquire("default")
+    assert list(limiter._mints) == ["default"]
+
+
+def test_requests_that_never_reach_google_do_not_use_the_mint_budget(client, monkeypatch):
+    monkeypatch.setattr(api, "_mint_limiter", api._MintLimiter(1, 60.0))
+    for _ in range(3):
+        assert client.post("/api/plugins/conduit_push/gemini-live/token?profile=nope").status_code == 503
+    assert api._mint_limiter._mints == {}
+    assert client.post("/api/plugins/conduit_push/gemini-live/token").status_code == 200
 
 
 def test_google_http_error_becomes_a_502_without_the_key(monkeypatch):
