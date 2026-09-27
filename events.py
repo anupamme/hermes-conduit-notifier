@@ -98,15 +98,21 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     # Fail closed: both the event and its decision are rebuilt from explicit
     # allowlists, so an unknown or text-bearing key (a raw `command`, say)
     # can never ride along with a redacted event.
+    # The decision is first run through the same sanitizer push_event uses
+    # (qid charset/reserved names, bounds), so a raw send_now caller gets the
+    # same guarantees as the in-repo builders.
     redacted = {key: event[key] for key in _REDACTED_EVENT_KEYS if key in event}
-    decision = event.get("decision")
-    if isinstance(decision, dict) and decision.get("kind") == "approval":
-        redacted["decision"] = {
-            "kind": "approval",
-            "description": REDACTED_APPROVAL_TEXT,
-            **{key: decision[key] for key in ("session_key", "choices") if key in decision},
-        }
-    elif isinstance(decision, dict) and decision.get("kind") == "clarify":
+    decision = sanitize_decision(event.get("decision")) if event.get("decision") is not None else {}
+    if decision.get("kind") == "approval":
+        choices = [choice for choice in decision.get("choices", []) if choice in _APPROVAL_CHOICES]
+        if choices:
+            redacted["decision"] = {
+                "kind": "approval",
+                "description": REDACTED_APPROVAL_TEXT,
+                "session_key": decision["session_key"],
+                "choices": choices,
+            }
+    elif decision.get("kind") == "clarify":
         clarify: dict[str, Any] = {
             "kind": "clarify",
             "question": REDACTED_QUESTION_TEXT,
@@ -126,6 +132,8 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+# The gateway's approval vocabulary (the relay whitelists the same set).
+_APPROVAL_CHOICES = ("once", "session", "always", "deny")
 _REDACTED_EVENT_KEYS = ("event_id", "type", "plugin_version", "plugin_capabilities", "session_id", "profile")
 
 

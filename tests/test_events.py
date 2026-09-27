@@ -396,7 +396,9 @@ def test_redact_event_fails_closed_on_unexpected_shapes():
     })
     assert "secret" not in json.dumps(redacted)
     assert redacted["decision"]["questions"] == [{"qid": "q1", "question": "Question 1"}]
-    assert "questions" not in redact_event({"decision": {"kind": "clarify", "question": "secret", "questions": "secret"}})["decision"]
+    # A clarify without its routing request id is not answerable: dropped whole.
+    assert "decision" not in redact_event({"decision": {"kind": "clarify", "question": "secret", "questions": "secret"}})
+    assert "questions" not in redact_event({"decision": {"kind": "clarify", "request_id": "r", "question": "secret", "questions": "secret"}})["decision"]
 
 
 def test_redact_event_drops_unknown_keys_at_every_level():
@@ -410,3 +412,14 @@ def test_redact_event_drops_unknown_keys_at_every_level():
     assert redacted["decision"] == {"kind": "approval", "description": REDACTED_APPROVAL_TEXT, "session_key": "s", "choices": ["once", "deny"]}
     clarify = redact_event({"decision": {"kind": "clarify", "request_id": "r", "question": "q", "questions": [{"qid": "q1", "question": "q", "note": "secret"}]}})
     assert "secret" not in json.dumps(clarify)
+
+
+def test_redact_event_applies_sanitizer_and_approval_vocabulary():
+    approval = redact_event({"decision": {"kind": "approval", "session_key": "s", "description": "x", "choices": ["Run rm -rf / secret", "deny"]}})
+    assert approval["decision"]["choices"] == ["deny"]
+    assert "secret" not in json.dumps(approval)
+    clarify = redact_event({"decision": {"kind": "clarify", "request_id": "r", "question": "q", "questions": [
+        {"qid": "__proto__", "question": "q", "choices": ["a"]},
+        {"qid": "q1", "question": "q", "choices": ["a"]},
+    ]}})
+    assert [q["qid"] for q in clarify["decision"]["questions"]] == ["q1"]
