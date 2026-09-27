@@ -385,3 +385,15 @@ def test_redact_event_keeps_clarify_qids_and_choices_but_not_question_text():
     assert redacted["questions"][1]["multi_select"] is True
     assert "Deploy to prod?" not in json.dumps(redact_event(event))
     assert sanitize_decision(redacted) == redacted
+
+
+def test_redact_event_fails_closed_on_unexpected_shapes():
+    assert "decision" not in redact_event({"type": "approval.needed", "decision": "Run rm -rf build"})
+    assert "decision" not in redact_event({"type": "input.needed", "decision": {"kind": "other", "question": "secret"}})
+    redacted = redact_event({
+        "type": "input.needed",
+        "decision": {"kind": "clarify", "request_id": "r", "question": "secret", "questions": ["secret", {"qid": "q1", "question": "secret"}]},
+    })
+    assert "secret" not in json.dumps(redacted)
+    assert redacted["decision"]["questions"] == [{"qid": "q1", "question": "Question 1"}]
+    assert "questions" not in redact_event({"decision": {"kind": "clarify", "question": "secret", "questions": "secret"}})["decision"]

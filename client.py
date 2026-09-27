@@ -143,8 +143,9 @@ def _outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     # send_now is the one egress chokepoint (the delivery worker drains
     # enqueue() through it), so redaction runs exactly once per event and
     # every hook and the clarify loop get it without each builder having to
-    # remember. Reading the flag at send time also means a `redact on`
-    # takes effect for events already queued.
+    # remember. The flag is read at send time, so `redact on` covers events
+    # already queued and `redact off` releases them unredacted: the switch
+    # governs what leaves from the moment it is flipped.
     return redact_event(event) if state.get("redact_content") else event
 
 

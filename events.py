@@ -95,9 +95,11 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     them; an approval's are the fixed once/deny vocabulary. Returns a new
     dict; the input is not mutated.
     """
-    redacted = {key: value for key, value in event.items() if key not in ("title", "body")}
+    # Fail closed: anything that is not a recognizable decision shape is
+    # dropped rather than passed through with its text intact.
+    redacted = {key: value for key, value in event.items() if key not in ("title", "body", "decision")}
     decision = event.get("decision")
-    if isinstance(decision, dict):
+    if isinstance(decision, dict) and decision.get("kind") in ("approval", "clarify"):
         decision = dict(decision)
         if decision.get("kind") == "approval":
             decision["description"] = REDACTED_APPROVAL_TEXT
@@ -106,9 +108,11 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
             questions = decision.get("questions")
             if isinstance(questions, list):
                 decision["questions"] = [
-                    {**entry, "question": f"Question {index + 1}"} if isinstance(entry, dict) else entry
-                    for index, entry in enumerate(questions)
+                    {**entry, "question": f"Question {index + 1}"}
+                    for index, entry in enumerate(entry for entry in questions if isinstance(entry, dict))
                 ]
+            elif "questions" in decision:
+                del decision["questions"]
         redacted["decision"] = decision
     return redacted
 
