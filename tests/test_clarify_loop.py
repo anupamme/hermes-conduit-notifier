@@ -705,3 +705,94 @@ def test_user_agent_derives_from_the_plugin_version():
     # automatically instead of leaving a stale hand-written constant.
     assert loop.client.USER_AGENT == f"Hermes-Conduit-Notifier/{loop.client.PLUGIN_VERSION}"
     assert loop.client.PLUGIN_VERSION == "0.3.0"
+
+
+def test_send_now_redacts_only_when_the_profile_opts_in(monkeypatch):
+    client = loop.client
+    sent = []
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
+    event = {"event_id": "approval:12345678", "type": "approval.needed", "body": "Run rm -rf build"}
+
+    monkeypatch.setattr(client, "load_state", lambda: {"relay_url": "https://relay", "credential": "x"})
+    client.send_now(event)
+    monkeypatch.setattr(client, "load_state", lambda: {"relay_url": "https://relay", "credential": "x", "redact_content": True})
+    client.send_now(event)
+
+    assert sent[0]["body"] == "Run rm -rf build"
+    assert "body" not in sent[1]
+
+
+def test_enqueued_events_are_redacted_once_on_delivery(monkeypatch):
+    # Other tests replace loop.client.enqueue with a fake for good, so load a
+    # private copy of the real client module to exercise the real queue.
+    spec = importlib.util.spec_from_file_location("conduit_push._client_under_test", ROOT / "client.py")
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    sent = []
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
+    monkeypatch.setattr(client, "load_state", lambda: {"relay_url": "https://relay", "credential": "x", "redact_content": True})
+    event = {
+        "event_id": "input:12345678",
+        "type": "input.needed",
+        "body": "Deploy to prod?",
+        "decision": {"kind": "clarify", "request_id": "conduit-push-abc123", "question": "Deploy to prod?", "choices": ["Yes", "No"]},
+    }
+
+    assert client.enqueue(event)
+    client._events.join()
+
+    assert len(sent) == 1
+    assert "body" not in sent[0]
+    assert "Deploy to prod?" not in json.dumps(sent[0])
+    assert sent[0]["decision"]["choices"] == ["Yes", "No"]
+
+
+def test_redacted_event_ids_are_keyed_but_stable(monkeypatch):
+    client = loop.client
+    sent = []
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
+    event = {"event_id": "approval:0123456789abcdef0123456789abcdef", "type": "approval.needed"}
+    for key in ("a", "a", "b"):
+        monkeypatch.setattr(client, "load_state", lambda k=key: {"relay_url": "https://relay", "credential": "c", "redact_content": True, "redact_key": k})
+        client.send_now(event)
+    assert sent[0]["event_id"] == sent[1]["event_id"]  # replays still dedupe
+    assert sent[0]["event_id"] != event["event_id"]
+    assert sent[0]["event_id"] != sent[2]["event_id"]
+    assert sent[0]["event_id"].startswith("approval:")
+
+
+def test_set_redact_content_and_repairing_keep_the_flag(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("conduit_push._client_state_under_test", ROOT / "client.py")
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    monkeypatch.setattr(client, "state_path", lambda: tmp_path / "conduit-push.json")
+
+    assert client.set_redact_content(True) is False  # unpaired: nothing to configure
+
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: {"credential": "c", "installation_id": "i"})
+    client.claim_pairing("CODE")
+    assert client.set_redact_content(True) is True
+    assert client.load_state()["redact_content"] is True
+    key = client.load_state()["redact_key"]
+    assert key and key != "c"
+
+    client.claim_pairing("CODE")  # re-pair
+    assert client.load_state()["redact_content"] is True
+    assert client.load_state()["redact_key"] == key
+    client.set_redact_content(False)
+    assert not client.load_state().get("redact_content")
+
+
+def test_missing_redact_key_is_minted_once_and_reused(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("conduit_push._client_key_under_test", ROOT / "client.py")
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    monkeypatch.setattr(client, "state_path", lambda: tmp_path / "conduit-push.json")
+    client.save_state({"relay_url": "https://relay", "credential": "c", "redact_content": True})
+    sent = []
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
+    event = {"event_id": "approval:0123456789abcdef", "type": "approval.needed"}
+    client.send_now(event)
+    client.send_now(event)
+    assert sent[0]["event_id"] == sent[1]["event_id"] != event["event_id"]
+    assert client.load_state()["redact_key"]

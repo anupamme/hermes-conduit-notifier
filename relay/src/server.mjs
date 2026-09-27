@@ -469,6 +469,13 @@ function notificationFor(event, preferences, gateway = undefined) {
   // different profiles and sessions distinguishable in Notification Center.
   const body = preferences.show_previews && event.body ? event.body : notificationContext(generic.body, event);
   const completion = event.type === 'response.ready' || event.type === 'background_task.finished';
+  // Approval and clarify pushes wait on the user, so they chime by default:
+  // `!== false` keeps installations whose stored preferences predate
+  // attention_sound on that default. completion_sound keeps its original
+  // truthy test, so its behavior for any stored shape is unchanged.
+  // turn.failed is deliberately excluded: it reports, it doesn't wait on the user.
+  const attention = event.type === 'approval.needed' || event.type === 'input.needed';
+  const sound = (completion && preferences.completion_sound) || (attention && preferences.attention_sound !== false);
   // `decision` carries structured approval card content so Conduit can render
   // an answerable card from the push payload alone — the one-shot gateway
   // stream event is missed while the app is backgrounded. It has its own
@@ -498,7 +505,7 @@ function notificationFor(event, preferences, gateway = undefined) {
   const bodyConduit = { ...routing, ...(decision ? { decision } : {}) };
   const aps = {
     alert: { title, body },
-    ...(preferences.completion_sound && completion ? { sound: 'default' } : {}),
+    ...(sound ? { sound: 'default' } : {}),
     // Thread grouping is gateway-scoped: two dashboards both using session
     // "default" must never share a Notification Center thread. Gateway-less
     // callers (direct/test use) keep the legacy raw-session shape.

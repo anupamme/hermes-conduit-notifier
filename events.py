@@ -80,6 +80,65 @@ def push_event(
     return event
 
 
+REDACTED_APPROVAL_TEXT = "Hermes needs your approval. Open Conduit for details."
+REDACTED_QUESTION_TEXT = "Hermes needs your answer. Open Conduit for details."
+
+
+def redact_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Strip chat content from an outgoing event, keeping answer routing.
+
+    For profiles that opt into `hermes conduit-push redact on` (#192): no
+    title/body text leaves the gateway, and a decision keeps only the
+    structural fields the device needs to answer it (kind, session_key or
+    request_id, qids, choices, multi_select), with its display text replaced
+    by generic copy. Choice labels are kept because the answer is one of
+    them; an approval's are filtered to the gateway's once/session/always/deny
+    vocabulary. Returns a new
+    dict; the input is not mutated.
+    """
+    # Fail closed: both the event and its decision are rebuilt from explicit
+    # allowlists, so an unknown or text-bearing key (a raw `command`, say)
+    # can never ride along with a redacted event.
+    # The decision is first run through the same sanitizer push_event uses
+    # (qid charset/reserved names, bounds), so a raw send_now caller gets the
+    # same guarantees as the in-repo builders.
+    redacted = {key: event[key] for key in _REDACTED_EVENT_KEYS if key in event}
+    decision = sanitize_decision(event.get("decision")) if event.get("decision") is not None else {}
+    if decision.get("kind") == "approval":
+        # Unknown labels never transit; fall back to the always-valid subset
+        # (see approval_decision) so the card stays answerable.
+        choices = [choice for choice in decision.get("choices", []) if choice in _APPROVAL_CHOICES]
+        redacted["decision"] = {
+            "kind": "approval",
+            "description": REDACTED_APPROVAL_TEXT,
+            "session_key": decision["session_key"],
+            "choices": choices or ["once", "deny"],
+        }
+    elif decision.get("kind") == "clarify":
+        clarify: dict[str, Any] = {
+            "kind": "clarify",
+            "question": REDACTED_QUESTION_TEXT,
+            **{key: decision[key] for key in ("request_id", "choices") if key in decision},
+        }
+        questions = decision.get("questions")
+        if isinstance(questions, list):
+            entries = [entry for entry in questions if isinstance(entry, dict)]
+            clarify["questions"] = [
+                {
+                    "question": f"Question {index + 1}",
+                    **{key: entry[key] for key in ("qid", "choices", "multi_select") if key in entry},
+                }
+                for index, entry in enumerate(entries)
+            ]
+        redacted["decision"] = clarify
+    return redacted
+
+
+# The gateway's approval vocabulary (the relay whitelists the same set).
+_APPROVAL_CHOICES = ("once", "session", "always", "deny")
+_REDACTED_EVENT_KEYS = ("event_id", "type", "plugin_version", "plugin_capabilities", "session_id", "profile", "gateway")
+
+
 def approval_decision(*, session_key: str, description: str) -> dict[str, Any]:
     """Build the structured payload for an approval notification.
 

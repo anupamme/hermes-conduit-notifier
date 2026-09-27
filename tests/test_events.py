@@ -1,9 +1,10 @@
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from events import approval_decision, clarify_decision, clarification_text, event_id, is_silent_response, normalize_clarify_questions, push_event, sanitize_decision
+from events import REDACTED_APPROVAL_TEXT, REDACTED_QUESTION_TEXT, approval_decision, clarify_decision, clarification_text, event_id, is_silent_response, normalize_clarify_questions, push_event, redact_event, sanitize_decision
 
 
 def test_event_identifiers_are_stable_for_replayed_hooks():
@@ -337,3 +338,90 @@ def test_normalize_questions_locally_rejects_whole_batch_on_malformed_entry():
         ]
     })
     assert batch == [], "upstream rejects the batch; the mirror must not skip-and-renumber"
+
+
+def test_redact_event_strips_text_but_keeps_approval_routing():
+    event = push_event(
+        "approval.needed",
+        identifier="approval:12345678",
+        session_id="sess-1",
+        title="Run rm -rf build",
+        body="Run rm -rf build",
+        decision=approval_decision(session_key="sess-1", description="Run rm -rf build"),
+    )
+    redacted = redact_event(event)
+    assert "title" not in redacted and "body" not in redacted
+    assert redacted["decision"] == {
+        "kind": "approval",
+        "session_key": "sess-1",
+        "description": REDACTED_APPROVAL_TEXT,
+        "choices": ["once", "deny"],
+    }
+    assert redacted["session_id"] == "sess-1"
+    # The original event is untouched.
+    assert event["decision"]["description"] == "Run rm -rf build"
+    assert event["body"] == "Run rm -rf build"
+    # The redacted decision still passes the sanitizer the relay mirrors.
+    assert sanitize_decision(redacted["decision"]) == redacted["decision"]
+
+
+def test_redact_event_keeps_clarify_qids_and_choices_but_not_question_text():
+    decision = clarify_decision(
+        request_id="conduit-push-abc123",
+        question="Deploy to prod?",
+        choices=["Yes", "No"],
+        questions=[
+            {"qid": "q1", "question": "Deploy to prod?", "choices": ["Yes", "No"]},
+            {"qid": "q2", "question": "Which region?", "choices": ["eu", "us"], "multi_select": True},
+        ],
+    )
+    event = push_event("input.needed", identifier="input:12345678", body="Deploy to prod?", decision=decision)
+    redacted = redact_event(event)["decision"]
+    assert redacted["request_id"] == "conduit-push-abc123"
+    assert redacted["question"] == REDACTED_QUESTION_TEXT
+    assert redacted["choices"] == ["Yes", "No"]
+    assert [q["qid"] for q in redacted["questions"]] == ["q1", "q2"]
+    assert [q["question"] for q in redacted["questions"]] == ["Question 1", "Question 2"]
+    assert redacted["questions"][1]["multi_select"] is True
+    assert "Deploy to prod?" not in json.dumps(redact_event(event))
+    assert sanitize_decision(redacted) == redacted
+
+
+def test_redact_event_fails_closed_on_unexpected_shapes():
+    assert "decision" not in redact_event({"type": "approval.needed", "decision": "Run rm -rf build"})
+    assert "decision" not in redact_event({"type": "input.needed", "decision": {"kind": "other", "question": "secret"}})
+    redacted = redact_event({
+        "type": "input.needed",
+        "decision": {"kind": "clarify", "request_id": "r", "question": "secret", "questions": ["secret", {"qid": "q1", "question": "secret"}]},
+    })
+    assert "secret" not in json.dumps(redacted)
+    assert redacted["decision"]["questions"] == [{"qid": "q1", "question": "Question 1"}]
+    # A clarify without its routing request id is not answerable: dropped whole.
+    assert "decision" not in redact_event({"decision": {"kind": "clarify", "question": "secret", "questions": "secret"}})
+    assert "questions" not in redact_event({"decision": {"kind": "clarify", "request_id": "r", "question": "secret", "questions": "secret"}})["decision"]
+
+
+def test_redact_event_drops_unknown_keys_at_every_level():
+    redacted = redact_event({
+        "event_id": "approval:1",
+        "type": "approval.needed",
+        "extra": "secret",
+        "decision": {"kind": "approval", "session_key": "s", "description": "x", "command": "rm -rf / secret", "choices": ["once", "deny"]},
+    })
+    assert "secret" not in json.dumps(redacted)
+    assert redacted["decision"] == {"kind": "approval", "description": REDACTED_APPROVAL_TEXT, "session_key": "s", "choices": ["once", "deny"]}
+    clarify = redact_event({"decision": {"kind": "clarify", "request_id": "r", "question": "q", "questions": [{"qid": "q1", "question": "q", "note": "secret"}]}})
+    assert "secret" not in json.dumps(clarify)
+
+
+def test_redact_event_applies_sanitizer_and_approval_vocabulary():
+    approval = redact_event({"decision": {"kind": "approval", "session_key": "s", "description": "x", "choices": ["Run rm -rf / secret", "deny"]}})
+    assert approval["decision"]["choices"] == ["deny"]
+    fallback = redact_event({"decision": {"kind": "approval", "session_key": "s", "description": "x", "choices": ["secret"]}})
+    assert fallback["decision"]["choices"] == ["once", "deny"]
+    assert "secret" not in json.dumps(approval)
+    clarify = redact_event({"decision": {"kind": "clarify", "request_id": "r", "question": "q", "questions": [
+        {"qid": "__proto__", "question": "q", "choices": ["a"]},
+        {"qid": "q1", "question": "q", "choices": ["a"]},
+    ]}})
+    assert [q["qid"] for q in clarify["decision"]["questions"]] == ["q1"]

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
 import queue
+import secrets
 import socket
 import threading
 import urllib.error
@@ -15,7 +18,7 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 
-from .events import PLUGIN_VERSION
+from .events import PLUGIN_VERSION, redact_event
 
 
 DEFAULT_RELAY_URL = "https://push.milim.dev"
@@ -74,6 +77,13 @@ def claim_pairing(code: str, relay_url: str = DEFAULT_RELAY_URL, gateway_name: s
         "installation_id": body["installation_id"],
         "relay_url": body.get("relay_url") or relay_url.rstrip("/"),
     }
+    # Re-pairing over an existing pairing must not silently drop the
+    # profile's privacy choice.
+    previous = load_state() or {}
+    if previous.get("redact_content"):
+        state["redact_content"] = True
+    if previous.get("redact_key"):
+        state["redact_key"] = previous["redact_key"]
     save_state(state)
     return state
 
@@ -121,9 +131,60 @@ def send_now(event: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
         f"{state['relay_url'].rstrip('/')}/v1/events",
         method="POST",
         credential=state["credential"],
-        payload=event,
+        payload=_outgoing(event, state),
         timeout=timeout,
     )
+
+
+def set_redact_content(enabled: bool) -> bool:
+    """Persist this profile's content-redaction switch (#192).
+
+    Returns False when the profile is not paired (nothing to configure).
+    """
+    state = load_state()
+    if not state:
+        return False
+    state["redact_content"] = bool(enabled)
+    if enabled and not state.get("redact_key"):
+        # Local-only key for re-keying event ids; never sent to the relay.
+        state["redact_key"] = secrets.token_hex(32)
+    save_state(state)
+    return True
+
+
+def _outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    # send_now is the one egress chokepoint (the delivery worker drains
+    # enqueue() through it), so redaction runs exactly once per event and
+    # every hook and the clarify loop get it without each builder having to
+    # remember. The flag is read at send time, so `redact on` covers events
+    # already queued and `redact off` releases them unredacted: the switch
+    # governs what leaves from the moment it is flipped.
+    if not state.get("redact_content"):
+        return event
+    redacted = redact_event(event)
+    # Plain event ids are an unkeyed digest of hook data (for approvals,
+    # the command). Re-key them with a local-only secret the relay never
+    # receives: it still dedupes replays (same input -> same id) but cannot
+    # recompute the digest for guessed commands. Runs once per event at this
+    # chokepoint; the output is not meant to be fed back in.
+    event_id = redacted.get("event_id")
+    if isinstance(event_id, str) and event_id:
+        prefix = event_id.split(":", 1)[0] if ":" in event_id else "event"
+        keyed = hmac.new(_redact_key(state).encode(), event_id.encode(), hashlib.sha256).hexdigest()[:32]
+        redacted["event_id"] = f"{prefix}:{keyed}"
+    return redacted
+
+
+def _redact_key(state: dict[str, Any]) -> str:
+    # A state that has redact_content without a key (hand-edited, or written
+    # by a pre-key build) gets one minted and persisted once, so ids stay
+    # stable across deliveries and relay dedup keeps working.
+    key = state.get("redact_key")
+    if not key:
+        key = secrets.token_hex(32)
+        state["redact_key"] = key
+        save_state(state)
+    return str(key)
 
 
 def poll_decision(request_id: str) -> dict[str, Any]:
