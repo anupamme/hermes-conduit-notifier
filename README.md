@@ -187,7 +187,7 @@ call; the plugin then releases the parked decision (`DELETE
 reported as accepted. A batch answered partly natively and partly by relay
 stays open until the gateway's configured clarify timeout bounds it.
 
-## Gemini Live tokens (plugin 0.4+)
+## Gemini Live tokens
 
 Conduit's Gemini Live voice mode talks to Google directly from the phone, but
 the Gemini API key stays on your Hermes host. The plugin adds two routes to the
@@ -207,9 +207,10 @@ CONDUIT_GEMINI_LIVE_MODEL=gemini-3.8-live   # optional override
 
 Each token is a Google ephemeral token: one use, locked to that model, valid
 for 30 minutes, and it must open its Live session within a minute. Conduit
-asks for a fresh token for every connection. The API key itself is never
-returned or logged. `?profile=<name>` resolves another profile's key, as the
-`/api/audio/*` routes do. Restart the dashboard (`hermes gateway restart`)
+asks for a fresh token for every connection, capped at 20 per minute per
+profile. The API key itself is never returned or logged. `?profile=<name>` resolves another profile's key, as the
+`/api/audio/*` routes do, and fails with 503 rather than falling back to the
+default profile if it can't. Restart the dashboard (`hermes gateway restart`)
 after updating the plugin so the routes mount.
 
 ## Conduit support and privacy

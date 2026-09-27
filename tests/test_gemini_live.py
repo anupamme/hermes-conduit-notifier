@@ -91,6 +91,7 @@ def test_token_response_without_a_name_is_a_502():
 def client(monkeypatch):
     monkeypatch.setattr(api, "_env_value", lambda key: {"GEMINI_API_KEY": "secret"}.get(key))
     monkeypatch.setattr(api, "_post_json", lambda url, key, body: {"name": "auth_tokens/xyz"})
+    monkeypatch.setattr(api, "_mint_limiter", api._MintLimiter(api.MINT_LIMIT, api.MINT_WINDOW_S))
     app = FastAPI()
     app.include_router(api.router, prefix="/api/plugins/conduit_push")
     return TestClient(app)
@@ -104,6 +105,57 @@ def test_routes_return_status_and_token(client):
     assert token["ok"] is True
     assert token["token"] == "auth_tokens/xyz"
     assert "secret" not in json.dumps(token)
+
+
+def test_token_response_is_not_cacheable(client):
+    response = client.post("/api/plugins/conduit_push/gemini-live/token")
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_requested_profile_fails_closed_when_it_cannot_be_scoped(client):
+    # No hermes_cli in the test environment, so profile scoping is unavailable:
+    # the request must not fall back to the default profile's key.
+    for method, path in (("post", "token"), ("get", "status")):
+        response = getattr(client, method)(f"/api/plugins/conduit_push/gemini-live/{path}?profile=coder")
+        assert response.status_code == 503
+
+
+def test_token_route_rate_limits_per_profile(client, monkeypatch):
+    monkeypatch.setattr(api, "_mint_limiter", api._MintLimiter(2, 60.0))
+    codes = [client.post("/api/plugins/conduit_push/gemini-live/token").status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+
+
+def test_mint_limiter_frees_slots_after_the_window():
+    now = [0.0]
+    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0])
+    limiter.acquire("default")
+    with pytest.raises(api.TokenError) as raised:
+        limiter.acquire("default")
+    assert raised.value.status == 429
+    limiter.acquire("coder")
+    now[0] = 60.0
+    limiter.acquire("default")
+
+
+def test_google_http_error_becomes_a_502_without_the_key(monkeypatch):
+    import io
+    import urllib.error
+
+    def fail(request, timeout):
+        body = io.BytesIO(json.dumps({"error": {"message": "API key not valid"}}).encode())
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, body)
+
+    monkeypatch.setattr(api._opener, "open", fail)
+    with pytest.raises(api.TokenError) as raised:
+        api._post_json(api.TOKEN_URL, "secret", {})
+    assert raised.value.status == 502
+    assert "API key not valid" in str(raised.value)
+    assert "secret" not in str(raised.value)
+
+
+def test_redirects_are_not_followed():
+    assert api._NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://evil.example") is None
 
 
 def test_token_route_maps_failures_to_http_status(client, monkeypatch):

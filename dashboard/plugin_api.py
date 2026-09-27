@@ -15,13 +15,16 @@ import asyncio
 import json
 import logging
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
+from collections import deque
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,10 @@ MODEL_ENV_VAR = "CONDUIT_GEMINI_LIVE_MODEL"
 TOKEN_LIFETIME = timedelta(minutes=30)
 NEW_SESSION_WINDOW = timedelta(minutes=1)
 REQUEST_TIMEOUT_S = 15.0
+# Each Live connection (including every resume) needs its own token, so allow
+# bursts, but stop a looping client from burning the host's Gemini quota.
+MINT_LIMIT = 20
+MINT_WINDOW_S = 60.0
 
 
 class TokenError(Exception):
@@ -52,7 +59,8 @@ class TokenError(Exception):
 def _env_value(key: str) -> Optional[str]:
     try:
         from hermes_cli.config import get_env_value
-    except Exception:
+    except ImportError:
+        logger.warning("hermes_cli.config unavailable; reading %s from the process environment", key)
         return os.environ.get(key)
     return get_env_value(key)
 
@@ -85,6 +93,15 @@ def token_request_body(model: str, now: datetime) -> Dict[str, Any]:
     }
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # A redirect would resend the x-goog-api-key header to wherever it points.
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
 def _post_json(url: str, api_key: str, body: Dict[str, Any]) -> Dict[str, Any]:
     request = urllib.request.Request(
         url,
@@ -93,7 +110,7 @@ def _post_json(url: str, api_key: str, body: Dict[str, Any]) -> Dict[str, Any]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_S) as response:
+        with _opener.open(request, timeout=REQUEST_TIMEOUT_S) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # Google's error body names the problem (bad key, quota) without echoing the key.
@@ -143,14 +160,43 @@ def mint_gemini_live_token(
     }
 
 
+class _MintLimiter:
+    """Sliding-window cap on token mints, per profile."""
+
+    def __init__(self, limit: int, window_s: float, clock: Callable[[], float] = time.monotonic) -> None:
+        self.limit = limit
+        self.window_s = window_s
+        self.clock = clock
+        self._mints: Dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, key: str) -> None:
+        now = self.clock()
+        with self._lock:
+            mints = self._mints.setdefault(key, deque())
+            while mints and now - mints[0] >= self.window_s:
+                mints.popleft()
+            if len(mints) >= self.limit:
+                raise TokenError(429, "Too many Gemini Live token requests; try again shortly")
+            mints.append(now)
+
+
+_mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S)
+
+
 def _profile_scope(profile: Optional[str]):
-    """Resolve .env/config for ``profile`` the way /api/audio/* does."""
+    """Resolve .env/config for ``profile`` the way /api/audio/* does.
+
+    Fails closed: a requested profile that can't be scoped must never fall back
+    to the default profile's key.
+    """
     if not profile:
         return nullcontext()
     try:
         from hermes_cli.web_server_profiles import _config_profile_scope
-    except Exception:
-        return nullcontext()
+    except ImportError:
+        logger.warning("Cannot scope Gemini Live request to profile %r: profile scoping unavailable", profile)
+        raise TokenError(503, "This Hermes version can't resolve per-profile keys")
     return _config_profile_scope(profile)
 
 
@@ -164,14 +210,21 @@ async def _run_scoped(profile: Optional[str], fn: Callable[[], Dict[str, Any]]) 
 
 @router.get("/gemini-live/status")
 async def get_gemini_live_status(profile: Optional[str] = None) -> Dict[str, Any]:
-    return {"ok": True, **(await _run_scoped(profile, gemini_live_status))}
+    try:
+        return {"ok": True, **(await _run_scoped(profile, gemini_live_status))}
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
 
 
 @router.post("/gemini-live/token")
-async def create_gemini_live_token(profile: Optional[str] = None) -> Dict[str, Any]:
+async def create_gemini_live_token(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    # The body is a usable credential: keep it out of any cache on the way.
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     try:
+        _mint_limiter.acquire(profile or "")
         result = await _run_scoped(profile, mint_gemini_live_token)
     except TokenError as exc:
         logger.warning("Gemini Live token request failed: %s", exc)
-        raise HTTPException(status_code=exc.status, detail=str(exc))
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     return {"ok": True, **result}
