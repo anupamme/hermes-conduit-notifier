@@ -207,6 +207,12 @@ class _MintLimiter:
 
 
 _mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S)
+# Edge-level cap, keyed by a fixed bucket rather than the caller-supplied
+# ``profile`` value, so it can't be bypassed by rotating profile names and it
+# also covers /status (which has no per-profile limiter at all) and requests
+# that fail before ever reaching Google (e.g. bad profile, missing key).
+_EDGE_LIMIT = MINT_LIMIT * 3
+_edge_limiter = _MintLimiter(_EDGE_LIMIT, MINT_WINDOW_S)
 
 
 def _profile_scope(profile: Optional[str]):
@@ -236,6 +242,7 @@ async def _run_scoped(profile: Optional[str], fn: Callable[[], Dict[str, Any]]) 
 @router.get("/gemini-live/status")
 async def get_gemini_live_status(profile: Optional[str] = None) -> Dict[str, Any]:
     try:
+        _edge_limiter.acquire("status")
         return {"ok": True, **(await _run_scoped(profile, gemini_live_status))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc))
@@ -247,6 +254,9 @@ async def create_gemini_live_token(response: Response, profile: Optional[str] = 
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     try:
+        # Counted up front, before profile resolution, so it can't be dodged
+        # by probing with invalid/rotating profile names.
+        _edge_limiter.acquire("token")
         result = await _run_scoped(profile, lambda: mint_gemini_live_token(limiter_key=profile or ""))
     except TokenError as exc:
         logger.warning("Gemini Live token request failed: %s", exc)
