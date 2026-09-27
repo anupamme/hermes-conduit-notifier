@@ -781,3 +781,18 @@ def test_set_redact_content_and_repairing_keep_the_flag(monkeypatch, tmp_path):
     assert client.load_state()["redact_key"] == key
     client.set_redact_content(False)
     assert not client.load_state().get("redact_content")
+
+
+def test_missing_redact_key_is_minted_once_and_reused(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("conduit_push._client_key_under_test", ROOT / "client.py")
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    monkeypatch.setattr(client, "state_path", lambda: tmp_path / "conduit-push.json")
+    client.save_state({"relay_url": "https://relay", "credential": "c", "redact_content": True})
+    sent = []
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
+    event = {"event_id": "approval:0123456789abcdef", "type": "approval.needed"}
+    client.send_now(event)
+    client.send_now(event)
+    assert sent[0]["event_id"] == sent[1]["event_id"] != event["event_id"]
+    assert client.load_state()["redact_key"]

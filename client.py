@@ -82,8 +82,8 @@ def claim_pairing(code: str, relay_url: str = DEFAULT_RELAY_URL, gateway_name: s
     previous = load_state() or {}
     if previous.get("redact_content"):
         state["redact_content"] = True
-        if previous.get("redact_key"):
-            state["redact_key"] = previous["redact_key"]
+    if previous.get("redact_key"):
+        state["redact_key"] = previous["redact_key"]
     save_state(state)
     return state
 
@@ -170,9 +170,21 @@ def _outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     event_id = redacted.get("event_id")
     if isinstance(event_id, str) and event_id:
         prefix = event_id.split(":", 1)[0] if ":" in event_id else "event"
-        keyed = hmac.new(str(state.get("redact_key") or secrets.token_hex(32)).encode(), event_id.encode(), hashlib.sha256).hexdigest()[:32]
+        keyed = hmac.new(_redact_key(state).encode(), event_id.encode(), hashlib.sha256).hexdigest()[:32]
         redacted["event_id"] = f"{prefix}:{keyed}"
     return redacted
+
+
+def _redact_key(state: dict[str, Any]) -> str:
+    # A state that has redact_content without a key (hand-edited, or written
+    # by a pre-key build) gets one minted and persisted once, so ids stay
+    # stable across deliveries and relay dedup keeps working.
+    key = state.get("redact_key")
+    if not key:
+        key = secrets.token_hex(32)
+        state["redact_key"] = key
+        save_state(state)
+    return str(key)
 
 
 def poll_decision(request_id: str) -> dict[str, Any]:
