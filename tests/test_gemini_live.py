@@ -246,6 +246,22 @@ def test_client_id_warns_once_when_peer_is_loopback_and_trust_proxy_is_unset(mon
     assert len(warnings) == 1
 
 
+def test_client_id_warns_for_an_untrusted_forwarded_header_even_with_a_public_peer(monkeypatch):
+    # A public-IP proxy/load balancer (common in cloud LB setups) wouldn't
+    # trip the loopback/private check, but an X-Forwarded-For header present
+    # at all -- while TRUST_PROXY is off -- is itself a strong signal that
+    # the peer address isn't the real client.
+    monkeypatch.setattr(api, "TRUST_PROXY", False)
+    monkeypatch.setattr(api, "_logged_untrusted_proxy_warning", False)
+    warnings = []
+    monkeypatch.setattr(api.logger, "warning", lambda *args, **kwargs: warnings.append(args))
+
+    request = FakeRequest(client_host="203.0.113.5", headers={"x-forwarded-for": "198.51.100.9"})
+    api._client_id(request)
+
+    assert len(warnings) == 1
+
+
 def test_edge_limiter_isolates_by_caller(client, monkeypatch):
     monkeypatch.setattr(api, "_edge_status_limiter", api._MintLimiter(1, 60.0))
     ids = iter(["client-a", "client-a", "client-b"])
@@ -296,6 +312,20 @@ def test_edge_status_limit_429_sets_retry_after_header(client, monkeypatch):
     assert response.headers["retry-after"] == "50"  # ceil(60 - 10)
 
 
+def test_token_rate_limit_does_not_log_at_warning_level(client, monkeypatch):
+    monkeypatch.setattr(api, "_edge_token_limiter", api._MintLimiter(1, 60.0))
+    warnings = []
+    debugs = []
+    monkeypatch.setattr(api.logger, "warning", lambda *args, **kwargs: warnings.append(args))
+    monkeypatch.setattr(api.logger, "debug", lambda *args, **kwargs: debugs.append(args))
+
+    assert client.post("/api/plugins/conduit_push/gemini-live/token").status_code == 200
+    assert client.post("/api/plugins/conduit_push/gemini-live/token").status_code == 429
+
+    assert warnings == []
+    assert len(debugs) == 1
+
+
 def test_edge_token_limit_429_sets_retry_after_and_no_store_header(client, monkeypatch):
     now = [0.0]
     monkeypatch.setattr(api, "_edge_token_limiter", api._MintLimiter(1, 60.0, clock=lambda: now[0]))
@@ -339,6 +369,17 @@ def test_edge_limit_env_vars_reject_non_finite_window(monkeypatch, bad_window):
     assert module._EDGE_STATUS_WINDOW_S == module.DEFAULT_EDGE_STATUS_WINDOW_S
 
 
+def test_edge_limit_env_vars_reject_huge_integer_without_crashing(monkeypatch):
+    # int(raw) succeeds for an arbitrarily large numeral (Python ints have no
+    # fixed width), but math.isfinite(value) then raises OverflowError for a
+    # value too large to convert to a float. Since this parsing runs at
+    # module import time, an uncaught OverflowError here would crash the
+    # whole plugin on load.
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_STATUS_LIMIT", "9" * 400)
+    module = _load_plugin_api()
+    assert module._EDGE_STATUS_LIMIT == module.DEFAULT_EDGE_STATUS_LIMIT
+
+
 def test_mint_limiter_sweep_waits_for_the_interval_even_once_entries_are_stale():
     now = [0.0]
     limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0], sweep_interval_s=120.0)
@@ -372,6 +413,25 @@ def test_mint_limiter_lru_eviction_skips_a_still_live_bucket():
     # LRU-most entry since it was never touched again.
     limiter.acquire("d")
     assert "a" not in limiter._mints
+
+
+def test_mint_limiter_hard_cap_evicts_even_a_live_bucket():
+    now = [0.0]
+    limiter = api._MintLimiter(
+        5, 60.0, clock=lambda: now[0], max_buckets=1, hard_max_buckets=2, sweep_interval_s=1e9
+    )
+    limiter.acquire("a")
+    now[0] = 1.0
+    limiter.acquire("b")
+    # At max_buckets(1) but not yet at hard_max_buckets(2): "a" is live, so
+    # eviction is skipped and the map is allowed to hold 2 entries.
+    assert set(limiter._mints) == {"a", "b"}
+    now[0] = 2.0
+    limiter.acquire("c")
+    # Now at hard_max_buckets(2): the LRU bucket ("a") is evicted regardless
+    # of liveness, so the map still has a genuine ceiling.
+    assert "a" not in limiter._mints
+    assert set(limiter._mints) == {"b", "c"}
 
 
 def test_requests_that_never_reach_google_do_not_use_the_mint_budget(client, monkeypatch):

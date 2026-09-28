@@ -52,10 +52,12 @@ EDGE_STATUS_WINDOW_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_STATUS_WINDOW_S"
 EDGE_TOKEN_LIMIT_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_TOKEN_LIMIT"
 EDGE_TOKEN_WINDOW_ENV_VAR = "CONDUIT_GEMINI_LIVE_EDGE_TOKEN_WINDOW_S"
 TRUST_PROXY_ENV_VAR = "CONDUIT_GEMINI_LIVE_TRUST_PROXY"
-# /status is a cheap, side-effect-free read with no per-profile limiter of its
-# own, so its edge budget is generous -- sized to comfortably exceed normal
-# dashboard polling cadence rather than to closely ration usage.
-DEFAULT_EDGE_STATUS_LIMIT = 60
+# /status is a cheap, side-effect-free read with no per-profile limiter of
+# its own, so its edge budget is generous -- 120/60s gives headroom above
+# roughly a 1 Hz dashboard poll, rather than sitting exactly on that
+# boundary (60/60s would be exactly 1 req/s, so a steady 1 Hz poller could
+# trip the sliding window intermittently).
+DEFAULT_EDGE_STATUS_LIMIT = 120
 DEFAULT_EDGE_STATUS_WINDOW_S = 60.0
 # /token feeds Google quota, so its edge budget (enforced before profile
 # resolution) matches the per-profile MINT_LIMIT/MINT_WINDOW_S it backstops,
@@ -222,12 +224,14 @@ class _MintLimiter:
         window_s: float,
         clock: Callable[[], float] = time.monotonic,
         max_buckets: int = 10_000,
+        hard_max_buckets: Optional[int] = None,
         sweep_interval_s: float = 30.0,
     ) -> None:
         self.limit = limit
         self.window_s = window_s
         self.clock = clock
         self.max_buckets = max_buckets
+        self.hard_max_buckets = hard_max_buckets if hard_max_buckets is not None else max_buckets * 2
         self.sweep_interval_s = sweep_interval_s
         self._mints: "OrderedDict[str, deque]" = OrderedDict()
         self._lock = threading.Lock()
@@ -246,18 +250,19 @@ class _MintLimiter:
             if key not in self._mints and len(self._mints) >= self.max_buckets:
                 # Hard cap on tracked buckets bounds memory even within one
                 # sweep interval, when keys are attacker-influenced
-                # addresses rather than bounded profile names. Only evict the
-                # least-recently-used bucket if it's actually idle (its own
-                # newest mint has aged out of the window) -- otherwise a
-                # caller could flood distinct filler keys to force its own
-                # live, still-in-window counter to be evicted early,
-                # resetting its budget ahead of schedule. If the LRU bucket
-                # is still live, skip eviction for this call; the map
-                # temporarily exceeds max_buckets rather than discarding a
-                # live counter, and the time-gated sweep above still bounds
-                # long-term growth.
+                # addresses rather than bounded profile names. Below
+                # max_buckets normally, and up to hard_max_buckets, only
+                # evict the least-recently-used bucket if it's actually idle
+                # (its own newest mint has aged out of the window) --
+                # otherwise a caller could flood distinct filler keys to
+                # force its own live, still-in-window counter to be evicted
+                # early, resetting its budget ahead of schedule. Past
+                # hard_max_buckets, evict the LRU bucket regardless of
+                # liveness, so memory still has a genuine ceiling even if a
+                # source presents many simultaneously-live distinct keys
+                # within one window.
                 lru_key, lru_mints = next(iter(self._mints.items()))
-                if now - lru_mints[-1] >= self.window_s:
+                if now - lru_mints[-1] >= self.window_s or len(self._mints) >= self.hard_max_buckets:
                     del self._mints[lru_key]
             mints = self._mints.setdefault(key, deque())
             self._mints.move_to_end(key)
@@ -294,16 +299,17 @@ def _positive_env(name: str, default: _T, cast: Callable[[str], _T]) -> _T:
         return default
     try:
         value = cast(raw)
-    except ValueError:
+        # math.isfinite rejects "nan"/"inf": both pass a bare `value <= 0`
+        # check (nan compares False to everything; inf compares False to
+        # <= 0), and a non-finite window/limit would silently break every
+        # comparison in _MintLimiter (a caller could get stuck 429'd
+        # forever, or never limited at all). It also raises OverflowError
+        # for an int too large to convert to a float (e.g. a many-digit
+        # env value), which would otherwise crash this module at import.
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{value!r} is not a usable positive value")
+    except (ValueError, OverflowError):
         logger.warning("Ignoring invalid %s=%r; using default %s", name, raw, default)
-        return default
-    # math.isfinite rejects "nan"/"inf": both pass a bare `value <= 0` check
-    # (nan compares False to everything; inf compares False to <= 0), and a
-    # non-finite window/limit would silently break every comparison in
-    # _MintLimiter (a caller could get stuck 429'd forever, or never limited
-    # at all).
-    if not math.isfinite(value) or value <= 0:
-        logger.warning("Ignoring non-finite/non-positive %s=%r; using default %s", name, raw, default)
         return default
     return value
 
@@ -384,9 +390,10 @@ def _warn_about_shared_edge_bucket_once(host: str) -> None:
         return
     _logged_untrusted_proxy_warning = True
     logger.warning(
-        "Gemini Live edge rate limiter saw a loopback/private peer address (%s) with "
-        "%s unset. If this dashboard is reached through a reverse proxy, SSH tunnel, or "
-        "similar, every caller may appear as this one address and share a single "
+        "Gemini Live edge rate limiter saw peer address %s, which may not be the real "
+        "client, with %s unset. If this dashboard is reached through a reverse proxy, "
+        "SSH tunnel, or similar, every caller may appear as this one address (or the "
+        "X-Forwarded-For header seen here is being ignored) and share a single "
         "rate-limit bucket. Set %s=1 only if that proxy overwrites (not appends) "
         "X-Forwarded-For with the real client address.",
         host,
@@ -428,7 +435,14 @@ def _client_id(request: Request) -> str:
         addr = ipaddress.ip_address(client.host)
     except ValueError:
         return client.host
-    if not TRUST_PROXY and (addr.is_loopback or addr.is_private):
+    if not TRUST_PROXY and (
+        addr.is_loopback or addr.is_private or request.headers.get("x-forwarded-for")
+    ):
+        # Loopback/private peers are the common local-proxy/tunnel case;
+        # an untrusted X-Forwarded-For header present at all is a strong
+        # signal of an interposed proxy even when its own peer address is
+        # public (e.g. a cloud load balancer), which the address check
+        # alone would miss.
         _warn_about_shared_edge_bucket_once(client.host)
     return _bucket_key_for_ip(addr)
 
@@ -467,7 +481,12 @@ async def create_gemini_live_token(
         _edge_token_limiter.acquire(_client_id(request))
         result = await _run_scoped(profile, lambda: mint_gemini_live_token(limiter_key=profile or ""))
     except TokenError as exc:
-        logger.warning("Gemini Live token request failed: %s", exc)
+        if exc.status == 429:
+            # Routine rate-limiting, not a failure -- logging it at warning
+            # would let a flooding caller generate unbounded warning volume.
+            logger.debug("Gemini Live token request rate-limited: %s", exc)
+        else:
+            logger.warning("Gemini Live token request failed: %s", exc)
         raise HTTPException(
             status_code=exc.status,
             detail=str(exc),

@@ -206,7 +206,7 @@ CONDUIT_GEMINI_LIVE_MODEL=gemini-3.8-live   # optional override
 CONDUIT_GEMINI_LIVE_API_VERSION=v1alpha      # optional; ephemeral tokens are v1alpha today
 
 # Optional: tune the rate limiters (defaults shown)
-CONDUIT_GEMINI_LIVE_EDGE_STATUS_LIMIT=60      # /status requests per caller address, per window
+CONDUIT_GEMINI_LIVE_EDGE_STATUS_LIMIT=120     # /status requests per caller address, per window
 CONDUIT_GEMINI_LIVE_EDGE_STATUS_WINDOW_S=60
 CONDUIT_GEMINI_LIVE_EDGE_TOKEN_LIMIT=20       # /token requests per caller address, per window
 CONDUIT_GEMINI_LIVE_EDGE_TOKEN_WINDOW_S=60
@@ -236,6 +236,12 @@ overwrites (not appends) that header — the dashboard logs a one-time warning
 if it sees this happening. This is a separate setting from the relay's own
 `TRUST_PROXY` (below); the two services aren't guaranteed to share a proxy,
 so set both if they do.
+
+On IPv6, the edge cap is keyed to the caller's `/64` network rather than its
+exact address, so a caller delegated a larger prefix (a typical residential
+`/56` or `/48`) can obtain a fresh `/64` bucket by varying its address within
+that prefix — the effective allowance for such a caller can be a multiple of
+the stated per-bucket default, not a hard ceiling.
 
 The API key itself is never returned or logged. `?profile=<name>` resolves another profile's key, as the
 `/api/audio/*` routes do, and fails with 503 rather than falling back to the
