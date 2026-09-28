@@ -69,6 +69,11 @@ DEFAULT_EDGE_TOKEN_WINDOW_S = MINT_WINDOW_S
 # Same strict "1" check as relay's TRUST_PROXY (relay/src/server.mjs):
 # X-Forwarded-For is only trusted when explicitly told this host sits behind
 # a reverse proxy that overwrites/strips any client-supplied copy of it.
+# Deliberately its own setting, prefixed like every other var in this file,
+# rather than sharing the relay's TRUST_PROXY: the relay is a separate,
+# independently-deployed service (a standalone push-notification relay) with
+# no guarantee it sits behind the same proxy as this dashboard. An operator
+# running both behind one proxy needs to set both flags.
 TRUST_PROXY = os.environ.get(TRUST_PROXY_ENV_VAR) == "1"
 
 
@@ -241,10 +246,19 @@ class _MintLimiter:
             if key not in self._mints and len(self._mints) >= self.max_buckets:
                 # Hard cap on tracked buckets bounds memory even within one
                 # sweep interval, when keys are attacker-influenced
-                # addresses rather than bounded profile names. Evict the
-                # least-recently-used bucket rather than refusing the
-                # request outright.
-                self._mints.popitem(last=False)
+                # addresses rather than bounded profile names. Only evict the
+                # least-recently-used bucket if it's actually idle (its own
+                # newest mint has aged out of the window) -- otherwise a
+                # caller could flood distinct filler keys to force its own
+                # live, still-in-window counter to be evicted early,
+                # resetting its budget ahead of schedule. If the LRU bucket
+                # is still live, skip eviction for this call; the map
+                # temporarily exceeds max_buckets rather than discarding a
+                # live counter, and the time-gated sweep above still bounds
+                # long-term growth.
+                lru_key, lru_mints = next(iter(self._mints.items()))
+                if now - lru_mints[-1] >= self.window_s:
+                    del self._mints[lru_key]
             mints = self._mints.setdefault(key, deque())
             self._mints.move_to_end(key)
             while mints and now - mints[0] >= self.window_s:
@@ -283,8 +297,13 @@ def _positive_env(name: str, default: _T, cast: Callable[[str], _T]) -> _T:
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; using default %s", name, raw, default)
         return default
-    if value <= 0:
-        logger.warning("Ignoring non-positive %s=%r; using default %s", name, raw, default)
+    # math.isfinite rejects "nan"/"inf": both pass a bare `value <= 0` check
+    # (nan compares False to everything; inf compares False to <= 0), and a
+    # non-finite window/limit would silently break every comparison in
+    # _MintLimiter (a caller could get stuck 429'd forever, or never limited
+    # at all).
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("Ignoring non-finite/non-positive %s=%r; using default %s", name, raw, default)
         return default
     return value
 
@@ -356,6 +375,26 @@ def _bucket_key_for_ip(addr: "ipaddress.IPv4Address | ipaddress.IPv6Address") ->
     return str(addr)
 
 
+_logged_untrusted_proxy_warning = False
+
+
+def _warn_about_shared_edge_bucket_once(host: str) -> None:
+    global _logged_untrusted_proxy_warning
+    if _logged_untrusted_proxy_warning:
+        return
+    _logged_untrusted_proxy_warning = True
+    logger.warning(
+        "Gemini Live edge rate limiter saw a loopback/private peer address (%s) with "
+        "%s unset. If this dashboard is reached through a reverse proxy, SSH tunnel, or "
+        "similar, every caller may appear as this one address and share a single "
+        "rate-limit bucket. Set %s=1 only if that proxy overwrites (not appends) "
+        "X-Forwarded-For with the real client address.",
+        host,
+        TRUST_PROXY_ENV_VAR,
+        TRUST_PROXY_ENV_VAR,
+    )
+
+
 def _client_id(request: Request) -> str:
     """Best-effort per-caller key for the edge limiters.
 
@@ -386,9 +425,12 @@ def _client_id(request: Request) -> str:
     if client is None or not client.host:
         return "unknown"
     try:
-        return _bucket_key_for_ip(ipaddress.ip_address(client.host))
+        addr = ipaddress.ip_address(client.host)
     except ValueError:
         return client.host
+    if not TRUST_PROXY and (addr.is_loopback or addr.is_private):
+        _warn_about_shared_edge_bucket_once(client.host)
+    return _bucket_key_for_ip(addr)
 
 
 def _retry_after_header(retry_after_s: Optional[float]) -> Dict[str, str]:

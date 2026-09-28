@@ -234,6 +234,18 @@ def test_client_id_keeps_loopback_distinct_from_other_addresses():
     assert loopback != other_all_zero_prefix
 
 
+def test_client_id_warns_once_when_peer_is_loopback_and_trust_proxy_is_unset(monkeypatch):
+    monkeypatch.setattr(api, "TRUST_PROXY", False)
+    monkeypatch.setattr(api, "_logged_untrusted_proxy_warning", False)
+    warnings = []
+    monkeypatch.setattr(api.logger, "warning", lambda *args, **kwargs: warnings.append(args))
+
+    api._client_id(FakeRequest(client_host="127.0.0.1"))
+    api._client_id(FakeRequest(client_host="127.0.0.1"))
+
+    assert len(warnings) == 1
+
+
 def test_edge_limiter_isolates_by_caller(client, monkeypatch):
     monkeypatch.setattr(api, "_edge_status_limiter", api._MintLimiter(1, 60.0))
     ids = iter(["client-a", "client-a", "client-b"])
@@ -317,6 +329,16 @@ def test_edge_limit_env_vars_fall_back_to_defaults_on_invalid_value(monkeypatch)
     assert module._EDGE_STATUS_WINDOW_S == module.DEFAULT_EDGE_STATUS_WINDOW_S
 
 
+@pytest.mark.parametrize("bad_window", ["nan", "inf", "-inf"])
+def test_edge_limit_env_vars_reject_non_finite_window(monkeypatch, bad_window):
+    # nan/inf both pass a bare `value <= 0` check in Python, so without an
+    # explicit isfinite guard a typo'd env value would silently produce a
+    # limiter whose window comparisons never behave sanely.
+    monkeypatch.setenv("CONDUIT_GEMINI_LIVE_EDGE_STATUS_WINDOW_S", bad_window)
+    module = _load_plugin_api()
+    assert module._EDGE_STATUS_WINDOW_S == module.DEFAULT_EDGE_STATUS_WINDOW_S
+
+
 def test_mint_limiter_sweep_waits_for_the_interval_even_once_entries_are_stale():
     now = [0.0]
     limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0], sweep_interval_s=120.0)
@@ -331,14 +353,25 @@ def test_mint_limiter_sweep_waits_for_the_interval_even_once_entries_are_stale()
     assert set(limiter._mints) == {"c"}
 
 
-def test_mint_limiter_evicts_lru_bucket_once_max_buckets_is_reached():
-    limiter = api._MintLimiter(5, 60.0, max_buckets=2, sweep_interval_s=1e9)
+def test_mint_limiter_lru_eviction_skips_a_still_live_bucket():
+    now = [0.0]
+    limiter = api._MintLimiter(5, 60.0, clock=lambda: now[0], max_buckets=2, sweep_interval_s=1e9)
     limiter.acquire("a")
+    now[0] = 1.0
     limiter.acquire("b")
-    limiter.acquire("a")  # refreshes "a" as most-recently-used
-    limiter.acquire("c")  # dict is at max_buckets(2): evicts the LRU bucket
-    # "b" (not "a", which was just re-touched), rather than refusing "c".
-    assert set(limiter._mints) == {"a", "c"}
+    # The map is at max_buckets(2); "a" is the LRU entry but still live
+    # (age 1 < window 60).
+    now[0] = 2.0
+    limiter.acquire("c")
+    # Eviction is skipped since the LRU bucket ("a") isn't stale yet, so the
+    # map temporarily holds more than max_buckets rather than discarding a
+    # live counter -- a caller can't force its own budget to reset early by
+    # flooding filler keys.
+    assert set(limiter._mints) == {"a", "b", "c"}
+    now[0] = 100.0  # "a" (age 99) is now genuinely idle; it's still the
+    # LRU-most entry since it was never touched again.
+    limiter.acquire("d")
+    assert "a" not in limiter._mints
 
 
 def test_requests_that_never_reach_google_do_not_use_the_mint_budget(client, monkeypatch):

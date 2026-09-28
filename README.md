@@ -204,12 +204,40 @@ Set the key in the profile's `.env` (the same key Hermes' Gemini TTS uses):
 GEMINI_API_KEY=...        # or GOOGLE_API_KEY
 CONDUIT_GEMINI_LIVE_MODEL=gemini-3.8-live   # optional override
 CONDUIT_GEMINI_LIVE_API_VERSION=v1alpha      # optional; ephemeral tokens are v1alpha today
+
+# Optional: tune the rate limiters (defaults shown)
+CONDUIT_GEMINI_LIVE_EDGE_STATUS_LIMIT=60      # /status requests per caller address, per window
+CONDUIT_GEMINI_LIVE_EDGE_STATUS_WINDOW_S=60
+CONDUIT_GEMINI_LIVE_EDGE_TOKEN_LIMIT=20       # /token requests per caller address, per window
+CONDUIT_GEMINI_LIVE_EDGE_TOKEN_WINDOW_S=60
+CONDUIT_GEMINI_LIVE_TRUST_PROXY=1             # only if a reverse proxy in front of this
+                                               # dashboard OVERWRITES X-Forwarded-For with
+                                               # the real client address (never set this
+                                               # behind an append-style proxy config)
 ```
 
 Each token is a Google ephemeral token: one use, locked to that model, valid
 for 30 minutes, and it must open its Live session within a minute. Conduit
-asks for a fresh token for every connection, capped at 20 per minute per
-profile. The API key itself is never returned or logged. `?profile=<name>` resolves another profile's key, as the
+asks for a fresh token for every connection. Two independent caps apply: a
+per-profile cap of 20 mints per minute (guards the host's Google quota), and
+a per-caller-address edge cap in front of both `/status` and `/token`
+(defaults above) that closes a bypass where rotating `?profile=` values could
+dodge the per-profile cap entirely. The edge cap is keyed by the request's
+source address, not by profile or user, so several profiles or several users
+behind one NAT/CGNAT address share one edge budget by default.
+
+That source address is the dashboard's own peer address unless
+`CONDUIT_GEMINI_LIVE_TRUST_PROXY=1` is set, in which case the first
+`X-Forwarded-For` hop is used instead. **If this dashboard is reached through
+a reverse proxy, an SSH tunnel, or anything else that makes every caller look
+like the same loopback/local address, every caller shares one edge budget
+unless you set `CONDUIT_GEMINI_LIVE_TRUST_PROXY=1`** on a proxy that
+overwrites (not appends) that header — the dashboard logs a one-time warning
+if it sees this happening. This is a separate setting from the relay's own
+`TRUST_PROXY` (below); the two services aren't guaranteed to share a proxy,
+so set both if they do.
+
+The API key itself is never returned or logged. `?profile=<name>` resolves another profile's key, as the
 `/api/audio/*` routes do, and fails with 503 rather than falling back to the
 default profile if it can't. Restart the dashboard (`hermes gateway restart`)
 after updating the plugin so the routes mount.
