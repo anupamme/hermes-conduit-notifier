@@ -21,7 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional, TypeVar
@@ -60,7 +60,10 @@ DEFAULT_EDGE_STATUS_WINDOW_S = 60.0
 # /token feeds Google quota, so its edge budget (enforced before profile
 # resolution) matches the per-profile MINT_LIMIT/MINT_WINDOW_S it backstops,
 # rather than being loosened just because it shares infrastructure with
-# /status.
+# /status. This is per caller address, not per profile, so a legitimate
+# client using several profiles -- or several users behind one NAT/CGNAT
+# address -- share one budget by default; operators in that situation
+# should raise CONDUIT_GEMINI_LIVE_EDGE_TOKEN_LIMIT.
 DEFAULT_EDGE_TOKEN_LIMIT = MINT_LIMIT
 DEFAULT_EDGE_TOKEN_WINDOW_S = MINT_WINDOW_S
 # Same strict "1" check as relay's TRUST_PROXY (relay/src/server.mjs):
@@ -213,34 +216,37 @@ class _MintLimiter:
         limit: int,
         window_s: float,
         clock: Callable[[], float] = time.monotonic,
-        sweep_size_threshold: int = 1000,
+        max_buckets: int = 10_000,
         sweep_interval_s: float = 30.0,
     ) -> None:
         self.limit = limit
         self.window_s = window_s
         self.clock = clock
-        self.sweep_size_threshold = sweep_size_threshold
+        self.max_buckets = max_buckets
         self.sweep_interval_s = sweep_interval_s
-        self._mints: Dict[str, deque] = {}
+        self._mints: "OrderedDict[str, deque]" = OrderedDict()
         self._lock = threading.Lock()
         self._last_sweep_at = float("-inf")
 
     def acquire(self, key: str) -> None:
         now = self.clock()
         with self._lock:
-            # A full-dict scan on every call is fine when keys are bounded
-            # (profile names), but keys can also be caller addresses, which
-            # an attacker influences. Gate the scan by size and time -- like
-            # relay's enforceRateLimit sweep -- so a flood of one-off keys
-            # can't turn every request into an O(n) scan.
-            if (
-                len(self._mints) > self.sweep_size_threshold
-                and now - self._last_sweep_at > self.sweep_interval_s
-            ):
+            # Time-gated sweep, independent of size (like relay's
+            # enforceRateLimit), so keeping the dict artificially small
+            # can't be used to dodge the gate.
+            if now - self._last_sweep_at > self.sweep_interval_s:
                 self._last_sweep_at = now
                 for stale in [k for k, q in self._mints.items() if now - q[-1] >= self.window_s]:
                     del self._mints[stale]
+            if key not in self._mints and len(self._mints) >= self.max_buckets:
+                # Hard cap on tracked buckets bounds memory even within one
+                # sweep interval, when keys are attacker-influenced
+                # addresses rather than bounded profile names. Evict the
+                # least-recently-used bucket rather than refusing the
+                # request outright.
+                self._mints.popitem(last=False)
             mints = self._mints.setdefault(key, deque())
+            self._mints.move_to_end(key)
             while mints and now - mints[0] >= self.window_s:
                 mints.popleft()
             if len(mints) >= self.limit:
@@ -330,8 +336,22 @@ async def _run_scoped(profile: Optional[str], fn: Callable[[], Dict[str, Any]]) 
 
 def _bucket_key_for_ip(addr: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> str:
     if addr.version == 6:
-        # Collapse to the routed /64 so a caller with a prefix can't rotate
-        # the low bits to mint a fresh bucket per request.
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            # ::ffff:a.b.c.d -- an IPv4 caller seen through a dual-stack
+            # socket. Its first 64 bits are always zero regardless of the
+            # embedded address, so without this every IPv4(-mapped) caller
+            # would collapse into one "::" bucket.
+            return str(mapped)
+        if addr.is_loopback:
+            # ::1's first 64 bits are also all zero; keep it out of the "::"
+            # bucket other all-zero-prefix addresses would otherwise share.
+            return str(addr)
+        # Collapse to the routed /64 -- a deliberate accuracy/abuse
+        # tradeoff: this narrows, but (for a caller routinely delegated a
+        # larger /56 or /48) doesn't eliminate, rotation within a caller's
+        # prefix, in exchange for not bucketing together unrelated
+        # customers who merely share a larger upstream allocation.
         return str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address)
     return str(addr)
 
@@ -345,10 +365,14 @@ def _client_id(request: Request) -> str:
 
     X-Forwarded-For is trusted only when CONDUIT_GEMINI_LIVE_TRUST_PROXY=1 is
     set -- i.e. only when this dashboard is known to sit behind a reverse
-    proxy that overwrites/strips any client-supplied copy of that header
-    before it reaches here (same trust model as relay's TRUST_PROXY).
-    Without that, a caller could vary the header per request to mint an
-    unlimited number of fresh buckets, defeating the limiter entirely.
+    proxy that OVERWRITES any client-supplied copy of that header with the
+    real connecting address (same trust model as relay's TRUST_PROXY).
+    Taking the first hop is only safe under that assumption: an
+    append-style config (e.g. nginx's default $proxy_add_x_forwarded_for)
+    leaves an attacker-supplied value first and fully defeats the limiter,
+    so TRUST_PROXY=1 must never be paired with an append-style proxy.
+    Without TRUST_PROXY, a caller could vary the header per request to mint
+    an unlimited number of fresh buckets, defeating the limiter entirely.
     """
     if TRUST_PROXY:
         forwarded = request.headers.get("x-forwarded-for", "")

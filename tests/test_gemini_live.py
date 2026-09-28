@@ -138,7 +138,7 @@ def test_mint_limiter_frees_slots_after_the_window():
     now = [0.0]
     # Force eager sweeping (as if unconditional) so this test still exercises
     # the stale-bucket prune directly; gating behavior has its own test below.
-    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0], sweep_size_threshold=0, sweep_interval_s=0)
+    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0], sweep_interval_s=0)
     limiter.acquire("default")
     with pytest.raises(api.TokenError) as raised:
         limiter.acquire("default")
@@ -205,6 +205,33 @@ def test_client_id_normalizes_ipv6_to_a_64_prefix():
     first = api._client_id(FakeRequest(client_host="2001:db8:1234:5678:aaaa::1"))
     second = api._client_id(FakeRequest(client_host="2001:db8:1234:5678:bbbb::2"))
     assert first == second == "2001:db8:1234:5678::"
+
+
+def test_client_id_does_not_collapse_across_a_64_boundary_within_one_56():
+    # Documents the accepted /64 tradeoff: a caller delegated a larger /56
+    # (or /48) can still get a fresh bucket per /64 within it.
+    first = api._client_id(FakeRequest(client_host="2001:db8:1234:5600::1"))
+    second = api._client_id(FakeRequest(client_host="2001:db8:1234:5601::1"))
+    assert first != second
+
+
+def test_client_id_unwraps_ipv4_mapped_ipv6_addresses():
+    mapped = api._client_id(FakeRequest(client_host="::ffff:203.0.113.5"))
+    plain = api._client_id(FakeRequest(client_host="203.0.113.5"))
+    assert mapped == plain == "203.0.113.5"
+
+
+def test_client_id_distinguishes_ipv4_mapped_addresses_by_embedded_ip():
+    first = api._client_id(FakeRequest(client_host="::ffff:203.0.113.5"))
+    second = api._client_id(FakeRequest(client_host="::ffff:198.51.100.9"))
+    assert first != second
+
+
+def test_client_id_keeps_loopback_distinct_from_other_addresses():
+    loopback = api._client_id(FakeRequest(client_host="::1"))
+    other_all_zero_prefix = api._client_id(FakeRequest(client_host="::2"))
+    assert loopback == "::1"
+    assert loopback != other_all_zero_prefix
 
 
 def test_edge_limiter_isolates_by_caller(client, monkeypatch):
@@ -290,21 +317,28 @@ def test_edge_limit_env_vars_fall_back_to_defaults_on_invalid_value(monkeypatch)
     assert module._EDGE_STATUS_WINDOW_S == module.DEFAULT_EDGE_STATUS_WINDOW_S
 
 
-def test_mint_limiter_only_sweeps_once_size_and_interval_thresholds_are_met():
+def test_mint_limiter_sweep_waits_for_the_interval_even_once_entries_are_stale():
     now = [0.0]
-    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0], sweep_size_threshold=1, sweep_interval_s=10.0)
+    limiter = api._MintLimiter(1, 60.0, clock=lambda: now[0], sweep_interval_s=120.0)
     limiter.acquire("a")
-    now[0] = 100.0  # "a" is now stale (age 100 >= window 60)
+    now[0] = 61.0  # "a" is stale (61 >= window 60), but only 61s since the
+    # last sweep (61 <= sweep_interval_s=120): the gate stays closed.
     limiter.acquire("b")
-    # len(_mints) was 1 (only "a") when acquiring "b", so "1 > 1" is False:
-    # the gate holds even though "a" is stale and the interval has passed.
     assert set(limiter._mints) == {"a", "b"}
-    now[0] = 200.0  # both "a" and "b" are now stale
+    now[0] = 130.0  # 130s since the last sweep: the gate opens and both
+    # "a" and "b" are stale by now (age 130 and 69 respectively).
     limiter.acquire("c")
-    # len(_mints) was 2 when acquiring "c", so "2 > 1" is True, and the
-    # interval condition holds too: the gate opens and drops both stale
-    # entries.
     assert set(limiter._mints) == {"c"}
+
+
+def test_mint_limiter_evicts_lru_bucket_once_max_buckets_is_reached():
+    limiter = api._MintLimiter(5, 60.0, max_buckets=2, sweep_interval_s=1e9)
+    limiter.acquire("a")
+    limiter.acquire("b")
+    limiter.acquire("a")  # refreshes "a" as most-recently-used
+    limiter.acquire("c")  # dict is at max_buckets(2): evicts the LRU bucket
+    # "b" (not "a", which was just re-touched), rather than refusing "c".
+    assert set(limiter._mints) == {"a", "c"}
 
 
 def test_requests_that_never_reach_google_do_not_use_the_mint_budget(client, monkeypatch):
